@@ -1,0 +1,41 @@
+name: Build Leinuo Wangke
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.21.0
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: pnpm run setup
+        env:
+          HUSKY: '0'
+      - run: pnpm build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: leinuo-wangke-userscript
+          path: |
+            userscript/dist/ocs.user.js
+            userscript/dist/ocs.common.user.js
+            userscript/LICENSE
+      - run: pnpm dist
+        if: github.event_name == 'workflow_dispatch'
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          name: leinuo-wangke-windows
+          path: |
+            desktop/releases/*.exe
+            desktop/releases/*.blockmap
+            desktop/releases/latest.yml

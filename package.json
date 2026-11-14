@@ -1,0 +1,19 @@
+{
+  "name": "leinuo-wangke",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "雷诺网课：OCS 桌面端与用户脚本的界面定制整合项目",
+  "license": "MIT",
+  "packageManager": "pnpm@10.21.0",
+  "engines": { "node": ">=22.18.0" },
+  "scripts": {
+    "setup": "node tools/project.ts setup",
+    "build": "node tools/project.ts build",
+    "build:script": "node tools/project.ts script",
+    "build:desktop": "node tools/project.ts desktop",
+    "check": "node tools/project.ts check",
+    "dev": "node tools/project.ts dev",
+    "dist": "node tools/project.ts dist"
+  }
+}

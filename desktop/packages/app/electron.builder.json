@@ -1,0 +1,99 @@
+{
+	"$schema": "https://json.schemastore.org/electron-builder.json",
+	"appId": "cn.leinuo.wangke",
+	"extraMetadata": {
+		"name": "leinuo-wangke",
+		"description": "雷诺网课桌面端，基于 OCS 的界面定制版本。"
+	},
+	"productName": "雷诺网课",
+	"directories": {
+		"output": "../../releases"
+	},
+	"compression": "maximum",
+	"copyright": "Copyright © 2021 ${author}",
+	"files": [
+		"out/**/*",
+		"public/favicon.png",
+		"public/favicon.icns",
+		"public/favicon.ico",
+		"public/icons/**/*",
+		"resources/extensions/*.zip",
+		"resources/extensions/*.manifest.json",
+		"LICENSES/**/*",
+		"package.json",
+		"node_modules/**/*",
+		"!**/*.map",
+		"!node_modules/xlsx/dist/{shim.min,xlsx.core.min,xlsx.extendscript,xlsx.full.min,xlsx,xlsx.min,xlsx.mini.min}.js"
+	],
+	"beforePack": "./scripts/before-pack.js",
+	"electronFuses": {
+		"enableEmbeddedAsarIntegrityValidation": true,
+		"onlyLoadAppFromAsar": true,
+		"enableNodeOptionsEnvironmentVariable": false,
+		"enableNodeCliInspectArguments": false
+	},
+	"nsis": {
+		"oneClick": true
+	},
+	"electronLanguages": [
+		"en-US",
+		"en-GB",
+		"zh-CN"
+	],
+	"publish": {
+		"provider": "generic",
+		"url": "https://github.com/3302294488/leinuo-wangke/releases/latest/download/"
+	},
+	"win": {
+		"icon": "public/favicon.png",
+		"artifactName": "leinuo-wangke-${version}-setup-${os}-${arch}.${ext}",
+		"target": [
+			{
+				"target": "nsis"
+			}
+		]
+	},
+	"mac": {
+		"icon": "public/favicon.icns",
+		"artifactName": "leinuo-wangke-${version}-setup-${os}-${arch}.${ext}",
+		"target": [
+			{
+				"target": "dmg"
+			}
+		]
+	},
+	"linux": {
+		"icon": "public/icons/512.png",
+		"executableName": "leinuo-wangke",
+		"syncDesktopName": true,
+		"artifactName": "leinuo-wangke-${version}-setup-${os}-${arch}.${ext}",
+		"target": [
+			{
+				"target": "AppImage"
+			},
+			{
+				"target": "deb"
+			}
+		]
+	},
+	"deb": {
+		"depends": [
+			"libgtk-3-0 | libgtk-3-0t64",
+			"libnotify4",
+			"libnss3",
+			"libxss1",
+			"libxtst6",
+			"xdg-utils",
+			"libatspi2.0-0 | libatspi2.0-0t64",
+			"libuuid1",
+			"libsecret-1-0",
+			"libgbm1",
+			"libxkbcommon0",
+			"libasound2 | libasound2t64",
+			"gnome-keyring"
+		],
+		"recommends": [
+			"kwallet6"
+		]
+	}
+}

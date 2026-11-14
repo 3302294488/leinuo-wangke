@@ -1,0 +1,1847 @@
+import { Instance as Chalk } from 'chalk';
+import {
+	LoggerCore,
+	DEFAULT_SERVER_PORT,
+	SUPPORTED_BROWSER_MAX_MAJOR,
+	formatExtensionArguments
+} from '@ocs-desktop/common';
+import path, { basename } from 'path';
+import fs from 'fs';
+import { chromium, BrowserContext, Page, LaunchOptions, Response, Request, CDPSession } from 'playwright-core';
+import type { AppStore, Config, ScriptWorker as ScriptWorkerContract, SystemScriptContext } from '@ocs-desktop/common';
+import { AutomationScripts, LegacyScriptMappings } from '../scripts/index';
+import { runSystemScripts } from '../scripts/system';
+import { initHttpCache } from '../utils/http-cache';
+import _get from 'lodash/get';
+import child_process from 'child_process';
+import http from 'http';
+import os from 'os';
+import crypto from 'crypto';
+import type { AddressInfo } from 'net';
+import { getBrowserMajorVersion, getExtensionPaths } from '../utils/browser';
+
+const { bgRedBright, bgBlueBright, bgYellowBright, bgGray } = new Chalk({ level: 2 });
+
+type AS = { name: string; configs: Record<string, Config> };
+
+type BrowserInfo = { name: string; notes: string; tags: { color: string; name: string }[] };
+
+type BrowserConfig = {
+	/** 是否启用弹窗 */
+	enable_dialog?: boolean;
+	/** 是否启用浏览器界面预览（Page.startScreencast 推流） */
+	screenshot_preview?: boolean;
+	/** 浏览器增强（防休眠/防冻结）：附加防节流启动参数 + 注入静音音频豁免脚本 */
+	browser_enhancement?: boolean;
+	/** 软件辅助：监听浏览器路由与用户脚本联动（默认开启，关闭后自动化增强不可用） */
+	script_assistance?: boolean;
+	/** 文件下载优化：恢复浏览器原生下载行为（默认开启，关闭后可能无法下载文件） */
+	download_optimization?: boolean;
+};
+
+interface Langs {
+	error_when_executable_not_found?: string;
+	error_when_browser_version_too_high?: string;
+	error_when_browser_launch_failed_too_fast?: string;
+	error_when_extension_version_too_low?: string;
+	error_when_playwright_selector_timeout?: string;
+	error_when_extension_not_found?: string;
+}
+
+/** 脚本工作线程（类型契约见 @ocs-desktop/common contract.ts） */
+export class ScriptWorker implements ScriptWorkerContract {
+	uid: string = '';
+	browser?: BrowserContext;
+	logger?: LoggerCore;
+	/** 拓展路径 */
+	extensionPaths: string[] = [];
+	/** 执行的自动化程序列表 */
+	automationScripts: AS[] = [];
+	/** 可关闭的浏览器拓展主页 */
+	store?: AppStore;
+	/** 是否启用自定义导航页（关闭后：初始页面为浏览器默认新标签页） */
+	bookmarkPageEnabled: boolean = true;
+	/** 浏览器中软件设置的名字 */
+	browserInfo?: BrowserInfo;
+	config?: BrowserConfig;
+	/** Screencast CDP 会话 */
+	screencastSession?: CDPSession;
+	/** Screencast 监控的目标页面 */
+	screencastPage?: Page;
+	/** Screencast 参数 */
+	screencastParams?: { everyNthFrame: number; maxWidth: number; maxHeight: number; quality: number };
+	/** Screencast 目标页 close 监听（命名以便重选/停止时移除） */
+	private screencastPageCloseListener?: () => void;
+	/** Screencast 新页面监听（browser 'page' 事件） */
+	private screencastNewPageListener?: (page: Page) => void;
+	/** Screencast 各页 load 监听（页面加载完成后自动切换推流目标，便于 off 清理） */
+	private screencastLoadListeners = new Map<Page, () => void>();
+	/** Screencast 启动中标志，防止并发重入导致 session 泄漏 */
+	private screencastStarting = false;
+	/** 关闭屏障：close() 开始后阻止新的 screencast session 附着，避免 browser.close() 与推流竞争挂起 */
+	private closing = false;
+	/** 背压：允许渲染端在途未消费的最大帧数（超限暂缓 ack，Chromium 自动降速） */
+	private static readonly SCREENCAST_MAX_IN_FLIGHT = 6;
+	/** 在途未消费帧数（渲染端汇报消费后递减） */
+	private screencastInFlight = 0;
+	/** 因背压暂缓的 screencast ack 队列 */
+	private screencastAckQueue: number[] = [];
+	/** 用户手动固定的推流目标页 URL（页面关闭或 URL 变化后自动清除） */
+	private screencastPinnedUrl?: string;
+	/** 页面列表广播防抖定时器 */
+	private pageListBroadcastTimer?: ReturnType<typeof setTimeout>;
+	/** 页面列表跟踪的监听清理函数集合 */
+	private pageListCleanups: (() => void)[] = [];
+	/** 内存占用上报定时器（launch 后启动，close/dispose 时清理） */
+	private memoryReportTimer?: ReturnType<typeof setInterval>;
+	/** 上次 CPU 采样（累计 cpuTime 秒数 + 采样时间戳），用于计算占用率 */
+	private lastCpuSample?: { time: number; cpuTime: number };
+	static langs?: Langs;
+	static lang: (key: keyof Langs, def?: string, replace?: Record<string, string>) => string = (key, def, replace) => {
+		const result = _get(ScriptWorker.langs, key, def);
+		return (replace ? result?.replace(/\{\{(\w+)\}\}/g, (_, k) => replace[k] || '') : result) as string;
+	};
+
+	static getTransformedErrorMessage = (error: string, extra_placeholder?: Record<string, string>) => {
+		if (error.match(/Timeout .+ exceeded/)) {
+			return ScriptWorker.lang(
+				'error_when_playwright_selector_timeout',
+				'页面元素查找超时，请检查元素是否存在/可见或选择器是否正确。',
+				{ error: error, ...extra_placeholder }
+			);
+		}
+		return error;
+	};
+
+	init({
+		store,
+		uid,
+		cachePath,
+		automationScripts,
+		browserInfo,
+		config,
+		langs
+	}: {
+		store: AppStore;
+		uid: string;
+		cachePath: string;
+		automationScripts: AS[];
+		browserInfo: BrowserInfo;
+		config: BrowserConfig;
+		langs: Langs;
+	}) {
+		this.debug('正在初始化进程...');
+
+		this.store = store;
+		ScriptWorker.langs = langs;
+
+		this.uid = uid;
+		// store 由渲染进程传入（render 已解密），读取自定义导航页开关，兼容旧版本缺省字段（默认开启）
+		this.bookmarkPageEnabled =
+			(store as AppStore & { render?: any }).render?.setting?.browser?.bookmarkPage?.enable !== false;
+		// 拓展文件夹路径
+		this.extensionPaths = getExtensionPaths(store.paths.extensionsFolder);
+		// HTTP 磁盘缓存根目录（worker 纯 Node 进程，与主进程共享 userData/cache/http）
+		initHttpCache(store.paths['user-data-path']);
+		// 导航页由 worker 启动后直接导航初始页展示（见 launchBrowser 的 startPage）
+
+		// 自动化程序
+		this.automationScripts = automationScripts;
+
+		// 初始化日志
+		this.logger = new LoggerCore(store.paths['logs-path'], false, 'script', path.basename(cachePath));
+
+		// 浏览器中软件设置的名字
+		this.browserInfo = browserInfo;
+		this.config = config;
+
+		this.debug('初始化成功');
+	}
+
+	async launch(
+		options: Required<Pick<LaunchOptions, 'executablePath' | 'headless' | 'args'>> & {
+			userDataDir: string;
+			userscripts: string[];
+			/** 总共启用的用户脚本数量（用于区分"无脚本"和"无需更新"） */
+			enabledScriptCount: number;
+		}
+	) {
+		if (this.extensionPaths.length) {
+			this.debug(
+				'加载拓展：',
+				this.extensionPaths.map((p) => basename(p))
+			);
+		} else {
+			this.debug('浏览器拓展为空');
+		}
+
+		/** 添加拓展启动参数 */
+		options.args = formatExtensionArguments(this.extensionPaths);
+		const start_time = Date.now();
+
+		/** =============================== 检测谷歌浏览器是否可用 =============================== */
+		if (!fs.existsSync(options.executablePath)) {
+			console.error(
+				ScriptWorker.lang(
+					'error_when_executable_not_found',
+					`浏览器可执行文件不存在，请在设置中更换浏览器路径。：${options.executablePath}`,
+					{ executablePath: options.executablePath }
+				)
+			);
+			return await this.close();
+		}
+
+		if (process.platform === 'win32') {
+			const major = getBrowserMajorVersion(options.executablePath);
+			console.log('major', major);
+			if (major && major > SUPPORTED_BROWSER_MAX_MAJOR) {
+				console.error(
+					ScriptWorker.lang(
+						'error_when_browser_version_too_high',
+						'当前浏览器版本过高，无法自动加载脚本管理器，请在设置-浏览器路径中切换“软件内置”浏览器，如果没有内置浏览器，请重新在官网下载最新雷诺网课软件并安装'
+					)
+				);
+				return await this.close();
+			}
+		}
+
+		/** =============================== 检测拓展是否可用 =============================== */
+		for (const extensionPath of this.extensionPaths) {
+			if (!fs.existsSync(extensionPath)) {
+				console.error(`拓展不存在：${extensionPath}`);
+				return await this.close();
+			}
+
+			if (!fs.existsSync(path.join(extensionPath, 'manifest.json'))) {
+				console.error(`拓展格式不正确，缺少manifest.json：${extensionPath}`);
+				return await this.close();
+			}
+
+			const manifest = JSON.parse(fs.readFileSync(path.join(extensionPath, 'manifest.json'), 'utf-8'));
+			// 检查是否为 MV2 拓展，如果是则报错
+			if (_get(manifest, 'manifest_version', 2) < 3) {
+				const name = getExtensionName(extensionPath);
+				console.error(
+					ScriptWorker.lang(
+						'error_when_extension_version_too_low',
+						`该拓展版本较低：{{name}}，请尝试前往软件左侧-应用中心-卸载并重新安装。`,
+						{ name }
+					)
+				);
+				return await this.close();
+			}
+		}
+
+		/** 启动浏览器 */
+		try {
+			await launchBrowser({
+				onLaunch: (browser) => {
+					this.browser = browser;
+
+					// 页面列表实时跟踪（新页面/关闭/导航时广播 pages-changed 给渲染进程）
+					this.setupPageListTracking(browser);
+
+					/** URL事件解析器 */
+					this.browser?.on('page', (page) => {
+						const match = page.url().match(/ocs-action_(.+)/);
+						if (match?.[1]) {
+							const action = match[1];
+							const actions: any = {
+								'bring-to-top': () => {
+									// 通过命令行打开此页面后会置顶浏览器，并自动关闭当前事件页面
+									page.close();
+								}
+							};
+
+							actions[action]();
+						}
+					});
+
+					// 浏览器启动完成
+					send('launched');
+					// 内存占用定时上报（真实值供渲染端启动预检测使用）
+					this.startMemoryReporting();
+					// 截图预览的启停交由渲染进程按卡片可见性驱动（Page.startScreencast），
+					// 此处不再自启动定时截图，避免不可见卡片浪费资源
+				},
+
+				automationScripts: this.automationScripts,
+				extensionPaths: this.extensionPaths,
+				// 起始页：自定义导航页（localhost）或浏览器默认新标签页
+				startPage: this.bookmarkPageEnabled
+					? `http://localhost:${
+							this.store?.server.port || DEFAULT_SERVER_PORT
+					  }/index.html#/bookmarks?uid=${encodeURIComponent(this.uid)}`
+					: 'chrome://newtab',
+				serverPort: this.store?.server.port || DEFAULT_SERVER_PORT,
+				closeableExtensionHomepages: [
+					'docs.scriptcat.org',
+					'docs.scriptcat.org/docs/change',
+					'docs.scriptcat.org/docs/use/open-dev',
+					'tampermonkey.net/index.php',
+					'tampermonkey.net/changelog.php'
+				],
+				authToken: this.store?.server.authToken || '',
+				browserInfo: this.browserInfo,
+				uid: this.uid,
+				config: this.config,
+				/** AppStore 快照（系统自动化程序使用） */
+				store: this.store,
+				/** 网页下载文件保存目录（软件设置中的"文件下载"目录） */
+				downloadsPath: this.store?.paths.downloadFolder,
+				...options
+			});
+		} catch (err) {
+			// 启动失败统一处理：发出 browser-closed 并退出进程，
+			// 避免渲染进程 Process.status 滞留 'launching'、卡片一直转圈只能重启软件恢复。
+			if (err instanceof Error) {
+				if (
+					err.message.includes('browser has been closed') ||
+					err.message.includes('Target closed') ||
+					err.message.includes('Browser closed')
+				) {
+					// 5秒内异常关闭，可能是浏览器问题
+					if (Date.now() - start_time < 5 * 1000) {
+						console.error(
+							ScriptWorker.lang(
+								'error_when_browser_launch_failed_too_fast',
+								'异常启动，请尝试重启浏览器，或者在设置中更换其他浏览器',
+								{
+									error: err.message.substring(0, 4000)
+								}
+							)
+						);
+					} else {
+						console.error('异常关闭，请尝试重启浏览器。', err.message.substring(0, 4000));
+					}
+				} else {
+					// 其它启动错误（如无法读取浏览器路径/权限/启动参数非法等）
+					console.error('浏览器启动失败 : ', err.message.substring(0, 4000));
+				}
+			} else {
+				console.error('未知错误 : ', String(err).substring(0, 4000));
+			}
+			// 统一走 close()：内部会 send('browser-closed') 并 process.exit()
+			return await this.close();
+		}
+
+		// 浏览器初始化完成
+		send('init');
+	}
+
+	/**
+	 * 获取该浏览器实例的真实资源占用（内存 MB + 全部子进程累计 cpuTime 秒）。
+	 * CDP 的 SystemInfo.getProcessInfo 只提供进程 PID 与 cpuTime（无内存字段），
+	 * 内存需再经系统 API 按 PID 汇总（见 getPidsMemoryMB）。
+	 */
+	async getResourceUsage(): Promise<{ mb: number; cpuTime: number }> {
+		if (!this.browser) return { mb: 0, cpuTime: 0 };
+		try {
+			const pwBrowser = this.browser.browser();
+			if (!pwBrowser) return { mb: 0, cpuTime: 0 };
+			const session = await pwBrowser.newBrowserCDPSession();
+			let pids: number[] = [];
+			let cpuTime = 0;
+			try {
+				const result = (await session.send('SystemInfo.getProcessInfo' as any)) as any;
+				const infos = (result?.processInfo || []) as any[];
+				pids = infos.map((p) => p.id).filter((id) => typeof id === 'number');
+				cpuTime = infos.reduce((sum, p) => sum + (p.cpuTime || 0), 0);
+			} finally {
+				await session.detach().catch(() => {});
+			}
+			return { mb: await getPidsMemoryMB(pids), cpuTime };
+		} catch (e) {
+			console.warn('[memory] 获取浏览器资源占用失败：', e);
+			return { mb: 0, cpuTime: 0 };
+		}
+	}
+
+	/** 启动资源占用定时上报：launch 后立即上报一次，此后每 10s 上报（事件：memory-usage） */
+	private startMemoryReporting() {
+		this.stopMemoryReporting();
+		this.lastCpuSample = undefined;
+		const report = async () => {
+			const { mb, cpuTime } = await this.getResourceUsage();
+			if (mb > 0 && !this.closing) {
+				// CPU 占用率：两次采样的累计 cpuTime 差值 / 墙钟时间（多核并行可超过 100%）
+				let cpuPercent = 0;
+				const now = Date.now();
+				if (this.lastCpuSample) {
+					const dt = (now - this.lastCpuSample.time) / 1000;
+					if (dt > 0) {
+						cpuPercent = Math.max(0, ((cpuTime - this.lastCpuSample.cpuTime) / dt) * 100);
+					}
+				}
+				this.lastCpuSample = { time: now, cpuTime };
+				send('memory-usage', this.uid, { mb, cpuPercent: Math.round(cpuPercent * 10) / 10 });
+			}
+		};
+		report();
+		this.memoryReportTimer = setInterval(report, 10 * 1000);
+		// unref：定时器不应阻止 worker 进程退出
+		this.memoryReportTimer.unref?.();
+	}
+
+	private stopMemoryReporting() {
+		if (this.memoryReportTimer) {
+			clearInterval(this.memoryReportTimer);
+			this.memoryReportTimer = undefined;
+		}
+		this.lastCpuSample = undefined;
+	}
+
+	async close() {
+		// 先置关闭屏障：阻止在途的 startScreencast 后续附着新的 CDP screencast session，
+		// 否则 browser.close() 撞上活跃 screencast 可能永久挂起（渲染端一直转圈）
+		this.closing = true;
+		this.stopMemoryReporting();
+		this.stopPageListTracking();
+		// 仅内部停止推流（detach session），不发 screencast-cleared：
+		// 渲染进程在 browser-closed 时保留最后一帧，用于"浏览器关闭后的预览图"展示
+		await this.stopScreencastInternal().catch(() => {});
+		// 兜底：browser.close() 挂起（如与在途推流操作竞争）时不阻塞退出，
+		// worker 进程退出后管道断开，Chromium 会随之自行退出
+		await Promise.race([
+			(async () => {
+				try {
+					await this.browser?.close();
+				} catch {}
+			})(),
+			new Promise((resolve) => setTimeout(resolve, 10 * 1000))
+		]);
+		this.browser = undefined;
+		send('browser-closed');
+		process.exit();
+	}
+
+	/**
+	 * 父进程断开（IPC disconnect）/收到终止信号时的自我回收：
+	 * 尽力关闭浏览器（含 Chromium）后由入口 process.exit。
+	 * 与 close() 的区别：不发送任何 IPC 事件——此时 IPC 通道已断开，send 会抛错导致无法退出。
+	 * 用于防止父进程（渲染进程）被强杀（如 dev 调试 Ctrl+C）后 worker 及其 Chromium 成为孤儿进程。
+	 */
+	async dispose() {
+		try {
+			this.stopMemoryReporting();
+			this.stopPageListTracking();
+		} catch {}
+		try {
+			await this.stopScreencastInternal();
+		} catch {}
+		try {
+			await this.browser?.close();
+		} catch {}
+		this.browser = undefined;
+	}
+
+	/**
+	 * 是否为不可推流的浏览器内部页面（chrome://、edge://、about:、extension:// 等）。
+	 * 这些页面无法被 CDP screencast 正常截取，选择目标时必须排除。
+	 */
+	private isInternalScreencastPage(page: Page): boolean {
+		const url = page.url();
+		return (
+			url.startsWith('chrome') ||
+			url.startsWith('edge') ||
+			url.startsWith('about:') ||
+			url.startsWith('extension:') ||
+			url.startsWith('moz-extension:')
+		);
+	}
+
+	/**
+	 * 选择当前 screencast 监控目标页面：按创建顺序（倒序）选择最近创建的可推流页面。
+	 * 新页面创建/加载后由事件驱动（page load / browser page）自动重选，
+	 * 无需也不依赖 visibilityState / 页面注入。
+	 */
+	private pickScreencastPage(): Page | undefined {
+		const pages = this.browser?.pages();
+		if (!pages || pages.length === 0) return undefined;
+		// 用户手动固定的目标页优先；目标已关闭/URL 已变化则清除固定并回退自动选择
+		if (this.screencastPinnedUrl) {
+			const pinned = pages.find((p) => p.url() === this.screencastPinnedUrl && !p.isClosed());
+			if (pinned && !this.isInternalScreencastPage(pinned)) return pinned;
+			this.screencastPinnedUrl = undefined;
+		}
+		return [...pages].reverse().find((p) => !this.isInternalScreencastPage(p)) || pages.at(-1);
+	}
+
+	/**
+	 * 页面列表实时跟踪：监听新页面创建、页面关闭、页面导航（framenavigated），
+	 * 任一变化后防抖广播 pages-changed 给渲染进程，驱动"切换页面"弹窗的 URL 列表实时更新。
+	 */
+	private setupPageListTracking(browser: BrowserContext) {
+		const trackPage = (page: Page) => {
+			const onChange = () => this.scheduleBroadcastPageList();
+			page.on('close', onChange);
+			page.on('framenavigated', onChange);
+			this.pageListCleanups.push(() => {
+				page.off('close', onChange);
+				page.off('framenavigated', onChange);
+			});
+		};
+
+		for (const page of browser.pages()) {
+			trackPage(page);
+		}
+		const onNewPage = (page: Page) => {
+			trackPage(page);
+			this.scheduleBroadcastPageList();
+		};
+		browser.on('page', onNewPage);
+		this.pageListCleanups.push(() => browser.off('page', onNewPage));
+
+		// 启动后广播一次初始列表
+		this.scheduleBroadcastPageList();
+	}
+
+	/** 防抖广播页面列表（导航/创建/关闭可能在短时间内连续触发） */
+	private scheduleBroadcastPageList() {
+		if (this.pageListBroadcastTimer) clearTimeout(this.pageListBroadcastTimer);
+		this.pageListBroadcastTimer = setTimeout(() => {
+			this.pageListBroadcastTimer = undefined;
+			this.broadcastPageList();
+		}, 300);
+	}
+
+	/** 广播当前全部可推流页面及当前推流目标给渲染进程 */
+	private async broadcastPageList() {
+		if (!this.browser) return;
+		const pages = this.browser.pages().filter((p) => !this.isInternalScreencastPage(p));
+		const infos = await Promise.all(
+			pages.map(async (p) => {
+				// 页面未声明 favicon 时回退为 origin/favicon.ico
+				let icon = await p
+					.evaluate(() => {
+						const link = document.querySelector<HTMLLinkElement>(
+							'link[rel~="icon"], link[rel="shortcut icon"], link[rel="apple-touch-icon"]'
+						);
+						return link?.href || '';
+					})
+					.catch(() => '');
+				if (!icon) {
+					try {
+						icon = new URL(p.url()).origin + '/favicon.ico';
+					} catch {
+						icon = '';
+					}
+				}
+				return {
+					url: p.url(),
+					title: await p.title().catch(() => ''),
+					icon
+				};
+			})
+		);
+		send('pages-changed', this.uid, {
+			pages: infos,
+			current: this.screencastPage && !this.screencastPage.isClosed() ? this.screencastPage.url() : ''
+		});
+	}
+
+	/** 停止页面列表跟踪并清理监听（浏览器关闭时调用） */
+	private stopPageListTracking() {
+		if (this.pageListBroadcastTimer) {
+			clearTimeout(this.pageListBroadcastTimer);
+			this.pageListBroadcastTimer = undefined;
+		}
+		for (const cleanup of this.pageListCleanups) cleanup();
+		this.pageListCleanups = [];
+		this.screencastPinnedUrl = undefined;
+	}
+
+	/**
+	 * 切换 screencast 推流目标到指定 URL 的页面（用户在预览卡片上手动选择）。
+	 * 固定目标后自动重选逻辑（新页面/load 事件）不会覆盖用户选择，
+	 * 直到目标页关闭或导航离开该 URL。
+	 */
+	async switchScreencastPage(url: string) {
+		const page = this.browser?.pages().find((p) => p.url() === url && !p.isClosed());
+		if (!page) return;
+		this.screencastPinnedUrl = url;
+		// 推流激活时立即重建流到目标页；未激活时仅记录固定目标，激活后自动生效
+		if (this.screencastParams) {
+			await this.startScreencast();
+		}
+		this.scheduleBroadcastPageList();
+	}
+
+	/**
+	 * 启动页面预览推流，帧由 IPC 直传渲染进程，由渲染进程按卡片可见性驱动调用。
+	 *
+	 * 时序：目标页面选定后，先等待页面运行完自动化流程（正在导航/加载时等待其 load），
+	 * 再直接 page.screenshot() 截取一帧作为首帧推送——Page.startScreencast 的首帧可能因
+	 * 页面忙于合成/窗口被遮挡而迟迟不来，截图兜底保证卡片立即有画面；
+	 * 随后建立 Page.startScreencast 实时推流，实时帧到达后自然覆盖首帧。
+	 * 不再使用"首帧看门狗 + 自动重试"：首帧由截图兜底，重选由页面 load / 新页面事件驱动。
+	 */
+	async startScreencast(opts?: { everyNthFrame?: number; maxWidth?: number; maxHeight?: number; quality?: number }) {
+		if (!this.browser || this.screencastStarting || this.closing) return;
+		this.screencastStarting = true;
+		try {
+			// 合并参数：优先用 opts，其次沿用已存参数（用于 page 切换重选），最后默认值
+			const params = {
+				everyNthFrame: opts?.everyNthFrame ?? this.screencastParams?.everyNthFrame ?? 4,
+				maxWidth: opts?.maxWidth ?? this.screencastParams?.maxWidth ?? 640,
+				maxHeight: opts?.maxHeight ?? this.screencastParams?.maxHeight ?? 360,
+				quality: opts?.quality ?? this.screencastParams?.quality ?? 35
+			};
+			this.screencastParams = params;
+
+			// 先清理旧的 session（page 切换重选场景）
+			await this.stopScreencastInternal();
+
+			// 推流激活期间始终开启目标跟踪（新页面创建 / load 完成后重选）
+			this.setupScreencastTracking();
+
+			const page = this.pickScreencastPage();
+			if (!page || this.isInternalScreencastPage(page)) {
+				// 暂无可用页面：不做定时重试，等待页面 load / 新页面出现事件自动驱动进入
+				this.info('[screencast] 暂无可用推流目标页，等待页面加载完成后自动推流');
+				return;
+			}
+
+			if (page.isClosed()) return;
+
+			// 提前挂目标页关闭监听并记录目标：等待/截图期间若页面被自动化流程关闭，可兜底重选
+			this.screencastPageCloseListener = () => this.handleScreencastPageGone();
+			this.screencastPage = page;
+			page.on('close', this.screencastPageCloseListener);
+
+			// 等待目标页面运行完自动化流程：页面仍在加载/导航时先等其 load，
+			// 避免把半加载的自动化页面截为首帧（已加载完成的页面会立即返回）
+			await page
+				.waitForLoadState('load', { timeout: 15 * 1000 })
+				.catch(() => this.debug('[screencast] 等待目标页 load 超时，按当前画面继续'));
+
+			// 直接截图作为首帧并推送（不依赖 Page.startScreencast 的首帧）
+			await this.captureScreencastFirstFrame(page, params);
+			// 等待期间被暂停/停止、页面已关闭或浏览器进入关闭流程：终止，禁止在关闭途中附着新 session
+			if (!this.screencastParams || page.isClosed() || this.closing) return;
+
+			try {
+				const session = await page.context().newCDPSession(page);
+				const sess = session;
+
+				session.on('Page.screencastFrame', ({ data, sessionId }) => {
+					if (this.screencastSession !== sess) return; // 旧会话迟到的帧，忽略
+					// 背压：记录在途帧并按额度 ack（在途超限时暂缓 ack，Chromium 自动降速防止 IPC 积压）
+					this.screencastInFlight++;
+					this.screencastAckQueue.push(sessionId);
+					this.flushScreencastAcks();
+					// 帧直接 IPC 直传渲染进程（base64），不再写盘
+					send('screencast-frame', this.uid, data);
+				});
+
+				await session.send('Page.startScreencast', {
+					format: 'jpeg',
+					quality: params.quality,
+					maxWidth: params.maxWidth,
+					maxHeight: params.maxHeight,
+					everyNthFrame: params.everyNthFrame
+				});
+
+				this.screencastSession = session;
+				this.info('[screencast] 实时推流已建立：', page.url());
+			} catch (err) {
+				// 建会话/启流失败：首帧截图已先行展示，等待后续 load / 新页面事件驱动重建
+				this.warn('[screencast] 建立实时推流失败（首帧截图仍可用）：', String(err));
+			}
+		} finally {
+			this.screencastStarting = false;
+			// 启动期间可能错过新页面 load/新页面事件：仅在实时流已建立且最近目标页已变化时补一次重选，
+			// 建流失败场景不做自动重试（首帧截图已兜底，后续由 load / 新页面事件驱动）
+			if (this.screencastParams && this.browser && this.screencastSession) {
+				const current = this.pickScreencastPage();
+				if (current && !current.isClosed() && current !== this.screencastPage) {
+					setTimeout(() => {
+						if (this.screencastParams && this.browser && !this.screencastStarting && this.screencastSession) {
+							this.startScreencast();
+						}
+					}, 300);
+				}
+			}
+		}
+	}
+
+	/**
+	 * 对目标页面直接截图并作为首帧推送给渲染进程。
+	 * 与 Page.startScreencast 无关：即使实时推流因页面忙于合成/窗口遮挡暂不产帧，
+	 * 也能让预览卡片先有画面；失败时静默返回，后续实时帧仍可接管。
+	 */
+	private async captureScreencastFirstFrame(
+		page: Page,
+		params: { everyNthFrame: number; maxWidth: number; maxHeight: number; quality: number }
+	) {
+		if (page.isClosed()) return;
+		try {
+			const buffer = await page.screenshot({
+				type: 'jpeg',
+				quality: params.quality,
+				timeout: 15 * 1000
+			});
+			send('screencast-frame', this.uid, buffer.toString('base64'));
+		} catch (err) {
+			this.debug('[screencast] 截图首帧失败：', String(err));
+		}
+	}
+
+	/**
+	 * 停止 screencast 推流、清理截图文件并通知渲染进程清理预览
+	 */
+	async stopScreencast() {
+		await this.stopScreencastInternal();
+		this.screencastParams = undefined; // 标记完全停止
+		send('screencast-cleared', this.uid);
+	}
+
+	/**
+	 * 暂停 screencast 推流：仅 detach session，不发 screencast-cleared。
+	 * 渲染进程保留最后一帧，切回/滚回视口时立即显示旧帧占位，startScreencast 重建推流后无缝衔接，避免重新等待。
+	 */
+	async pauseScreencast() {
+		await this.stopScreencastInternal();
+		this.screencastParams = undefined; // 标记暂停，避免 handleScreencastPageGone 误重选；恢复时由 opts 重建
+	}
+
+	/** 冲刷 screencast ack 队列：在途帧未超限时立即 ack；超限则保留（ack 延迟会让 Chromium 自动降速） */
+	private flushScreencastAcks() {
+		const session = this.screencastSession;
+		if (!session) return;
+		while (this.screencastInFlight <= ScriptWorker.SCREENCAST_MAX_IN_FLIGHT && this.screencastAckQueue.length) {
+			const sessionId = this.screencastAckQueue.shift()!;
+			session.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
+		}
+	}
+
+	/** 渲染端汇报已消费的推流帧数：释放在途额度并冲刷暂缓的 ack（背压反馈回路，由渲染进程调用） */
+	screencastConsumed(count: number) {
+		this.screencastInFlight = Math.max(0, this.screencastInFlight - count);
+		this.flushScreencastAcks();
+	}
+
+	/** 重置背压状态（停止/重建推流时调用） */
+	private resetScreencastBackpressure() {
+		this.screencastInFlight = 0;
+		this.screencastAckQueue = [];
+	}
+
+	/**
+	 * 仅停止 screencast session，不清理文件、不发事件（用于内部切换/重选）
+	 */
+	private async stopScreencastInternal() {
+		if (this.screencastSession) {
+			try {
+				await this.screencastSession.detach();
+			} catch {}
+			this.screencastSession = undefined;
+		}
+		// 移除目标页 close 监听，防止旧页面重选后重复触发
+		if (this.screencastPage && this.screencastPageCloseListener) {
+			this.screencastPage.off('close', this.screencastPageCloseListener);
+		}
+		this.screencastPage = undefined;
+		this.screencastPageCloseListener = undefined;
+		// 停止目标跟踪（各页 load 监听 / 新页面监听），暂停或停止后不再误重选
+		this.stopScreencastTracking();
+		// 重置背压状态，避免旧额度/旧 ack 队列污染下一次推流
+		this.resetScreencastBackpressure();
+	}
+
+	/**
+	 * 监控目标页面关闭后，延迟重选下一个页面继续推流
+	 */
+	private handleScreencastPageGone() {
+		if (!this.screencastParams) return; // 已主动停止
+		// session 随页面关闭已失效，无需 detach
+		this.screencastSession = undefined;
+		this.screencastPage = undefined;
+		setTimeout(() => {
+			// 仍在运行且未主动停止则沿用原参数重选
+			if (this.screencastParams && this.browser) {
+				this.startScreencast();
+			}
+		}, 500);
+	}
+
+	/**
+	 * 推流激活期间启动目标跟踪：按创建顺序跟踪页面。
+	 * 每个页面注册 page load 监听，页面加载完成后自动重选推流目标到最近创建的页面；
+	 * 新页面出现（browser 'page'）时同样注册监听并兜底重选，无需页面注入。
+	 */
+	private setupScreencastTracking() {
+		if (!this.browser) return;
+
+		// 对现有页面注册 load 监听（新页面 load 完成后自动切换推流目标）
+		for (const page of this.browser.pages()) {
+			this.attachScreencastLoad(page);
+		}
+
+		// 新页面出现时注册 load 监听并延迟兜底重选（等待页面加载），注册前先 off 防重复
+		if (this.screencastNewPageListener) {
+			this.browser.off('page', this.screencastNewPageListener);
+		}
+		this.screencastNewPageListener = (page) => {
+			this.attachScreencastLoad(page);
+			setTimeout(() => {
+				// 仍在推流激活期间才重选（兜底：页面 load 未触发或加载过慢）
+				if (this.screencastParams && this.browser) {
+					this.startScreencast();
+				}
+			}, 300);
+		};
+		this.browser.on('page', this.screencastNewPageListener);
+	}
+
+	/**
+	 * 为页面注册 load 监听：页面加载完成后自动重选推流目标（按创建顺序跟踪最近页面）。
+	 * 重复注册直接跳过；页面关闭时自动清理监听与记录。
+	 */
+	private attachScreencastLoad(page: Page) {
+		if (this.screencastLoadListeners.has(page)) return;
+		const handler = () => {
+			// 页面加载完成，重选到最近创建的页面
+			if (this.screencastParams && this.browser) {
+				this.startScreencast();
+			}
+		};
+		this.screencastLoadListeners.set(page, handler);
+		page.on('load', handler);
+		page.once('close', () => {
+			this.screencastLoadListeners.delete(page);
+			page.off('load', handler);
+		});
+	}
+
+	/**
+	 * 停止目标跟踪：清理各页 load 监听与新页面监听，暂停/停止后不再泄漏或误重选
+	 */
+	private stopScreencastTracking() {
+		for (const [page, handler] of this.screencastLoadListeners) {
+			page.off('load', handler);
+		}
+		this.screencastLoadListeners.clear();
+		if (this.screencastNewPageListener && this.browser) {
+			this.browser.off('page', this.screencastNewPageListener);
+			this.screencastNewPageListener = undefined;
+		}
+	}
+
+	// TODO
+	async bringToFront() {
+		this.browser?.pages().at(-1)?.bringToFront();
+	}
+
+	kill() {
+		process.exit();
+	}
+
+	debug(...msg: any[]) {
+		console.log(bgGray(loggerPrefix()), ...msg);
+	}
+
+	warn(...msg: any[]) {
+		console.log(bgYellowBright(loggerPrefix()), ...msg);
+	}
+
+	info(...msg: any[]) {
+		console.log(bgBlueBright(loggerPrefix()), ...msg);
+	}
+
+	error(...msg: any[]) {
+		console.error(bgRedBright(loggerPrefix()), ...msg);
+	}
+}
+
+/**
+ * 浏览器增强（防休眠/防冻结）启动参数：
+ * 最小化/后台窗口下仍可长时间运行 JS。开关关闭时不附加任何参数。
+ *
+ * 注意：Chromium CommandLine 对重复开关为"last wins"语义，且 Playwright 1.60 默认
+ * 已带一个 --disable-features 列表，此处必须携带其默认禁用项的并集，
+ * 升级 playwright-core 时需同步核对（lib/coreBundle.js 中 chromiumSwitches 的 disabledFeatures）。
+ * 其余独立开关与 Playwright 默认参数重复但无副作用（重复传入无影响）。
+ */
+function formatBrowserEnhancementArgs(config?: BrowserConfig): string[] {
+	if (!config?.browser_enhancement) return [];
+	return [
+		// 禁用后台页面定时器节流：隐藏页面的 setTimeout/setInterval 不再被对齐到 1 秒/次
+		'--disable-background-timer-throttling',
+		// 禁止渲染进程在后台时被降级（降低进程优先级/调度权重）
+		'--disable-renderer-backgrounding',
+		// 窗口被遮挡或最小化时不将页面视为后台，避免合成/调度被暂停
+		'--disable-backgrounding-occluded-windows',
+		// 禁用 IPC 洪泛保护，避免 worker 高频 CDP 调用（evaluate/推流 ack）被限流
+		'--disable-ipc-flooding-protection',
+		// 允许无用户手势自动播放（静音音频保活的前提，否则 AudioContext 会一直处于 suspended）
+		'--autoplay-policy=no-user-gesture-required',
+		'--disable-features=' +
+			[
+				// ↓ Playwright 1.60 默认禁用项（last-wins 语义下必须保留，否则丢失默认行为）
+				// 禁用 beforeunload 同步检查，避免自动化时页面卸载被阻塞（playwright#14047）
+				'AvoidUnnecessaryBeforeUnloadCheckSync',
+				// 修正节点移除时的边界事件派发跟踪，避免误判（playwright#38568）
+				'BoundaryEventDispatchTracksNodeRemoval',
+				// 关闭浏览器进程时不销毁用户数据目录（持久化上下文必需）
+				'DestroyProfileOnBrowserClose',
+				// 禁用拨号媒体路由提供方，避免投屏相关干扰（playwright#13854）
+				'DialMediaRouteProvider',
+				// 禁用全局媒体控制（工具栏媒体播放控制按钮）
+				'GlobalMediaControls',
+				// 禁用 HTTP 自动升级为 HTTPS，避免自动化导航被意外改写（playwright#27605）
+				'HttpsUpgrades',
+				// 隐藏地址栏 Lens 识图入口（非官方构建中不可用）
+				'LensOverlay',
+				// 禁用媒体路由/投屏功能（playwright#8162）
+				'MediaRouter',
+				// 禁用导航期间的绘制保持，避免旧页面残影（playwright#28023）
+				'PaintHolding',
+				// 禁用第三方存储分区，保持第三方 cookie 传统行为（playwright#32230）
+				'ThirdPartyStoragePartitioning',
+				// 禁用页面翻译弹窗（playwright#16126）
+				'Translate',
+				// 禁用自动提权（chromium issue 435410220）
+				'AutoDeElevate',
+				// 禁用新版 RenderDocument 导航行为，避免跨进程导航异常（playwright#37714）
+				'RenderDocument',
+				// 禁止启动时下载优化提示数据（减少启动网络活动）
+				'OptimizationHints',
+				// 禁用 Edge 强制浏览器登录
+				'msForceBrowserSignIn',
+				// 禁止 macOS 上更新 LaunchServices 首选版本记录
+				'msEdgeUpdateLaunchServicesPreferredVersion',
+				// ↓ 增强新增
+				// 禁用后台加强唤醒节流：页面隐藏 5 分钟后定时器不再被限制为 1 次/分钟（长时挂机关键）
+				'IntensiveWakeUpThrottling',
+				// 禁用后台标签页冻结（Chrome 对长时间不活跃标签的 freeze 机制）
+				'TabFreeze',
+				// 禁用省内存模式（防止不活跃标签被丢弃/杀进程，feature 名随版本可能变化，未知项会被忽略）
+				'MemorySaverMode'
+			].join(',')
+	];
+}
+
+function loggerPrefix() {
+	return `[OCS] ${new Date().toLocaleTimeString()}`;
+}
+
+/** 步骤提示函数：将初始化进度渲染到导航页 */
+type StepTips = (tips: string | string[], opts?: { loading?: boolean; warn?: boolean }) => Promise<void>;
+
+/**
+ * 浏览器增强：注入静音音频保活脚本（防休眠/防冻结），未开启时直接跳过。
+ * 隐身实现：闭包内局部状态，无全局变量、无函数/方法暴露、无原型篡改、无控制台输出，
+ * 页面被 Chrome 判定为"播放音频"，豁免后台加强节流与页面冻结；
+ * AudioContext 实例仅存于闭包，站点 JS 无任何 API 可枚举到。
+ */
+async function injectEnhancementKeepalive(browser: BrowserContext, config?: BrowserConfig) {
+	if (!config?.browser_enhancement) return;
+	await browser.addInitScript(() => {
+		// 仅顶层 frame，避免 iframe 重复创建
+		if (window.top !== window) return;
+		let started = false;
+		const start = () => {
+			if (started) return;
+			started = true;
+			try {
+				const Ctor: typeof AudioContext | undefined = window.AudioContext || (window as any).webkitAudioContext;
+				if (!Ctor) return;
+				const ctx = new Ctor();
+				const osc = ctx.createOscillator();
+				const gain = ctx.createGain();
+				gain.gain.value = 0; // 静音
+				osc.frequency.value = 1;
+				osc.connect(gain);
+				gain.connect(ctx.destination);
+				osc.start();
+				// 若上下文被挂起（autoplay 策略未生效时），首次真实手势时恢复
+				if (ctx.state === 'suspended') {
+					const resume = () => {
+						ctx.resume().catch(() => {});
+					};
+					for (const e of ['click', 'keydown', 'touchstart']) {
+						window.addEventListener(e, resume, { once: true, passive: true, capture: true });
+					}
+				}
+			} catch {
+				// 静默：不向页面暴露任何痕迹
+			}
+		};
+		// --autoplay-policy=no-user-gesture-required 下可立即启动；否则首个真实手势时启动
+		start();
+		if (!started) {
+			for (const e of ['click', 'keydown', 'touchstart']) {
+				window.addEventListener(e, start, { once: true, passive: true, capture: true });
+			}
+		}
+	});
+	// 浏览器日志输出（仅测试观察用，网站无法读取进程日志，不构成探查面）
+	console.log(bgGray(loggerPrefix()), '[enhancement] 静音音频保活脚本已注入（浏览器增强已开启）');
+}
+
+/**
+ * 创建步骤提示函数：将初始化进度渲染到导航页（顶层页，worker 直接导航 localhost 导航页 URL）。
+ * 页面导航/加载存在时序窗口，轮询等待导航页就绪后再执行；
+ * 未找到导航页时静默跳过，不再使用 textContent 覆盖页面。
+ */
+function createStepFunction(page: Page, serverPort: number): StepTips {
+	return async (tips, opts) => {
+		const { loading = true, warn = false } = opts || {};
+		const state = { tips: Array.isArray(tips) ? tips : [tips], loading, warn };
+		const navOrigin = `http://localhost:${serverPort}`;
+
+		try {
+			// 定位导航页：起始页 goto 与导航完成存在时序窗口，轮询等待（8s 超时则跳过提示，不破坏页面）
+			const findNavFrame = () => (page.url().startsWith(navOrigin) ? page.mainFrame() : undefined);
+
+			let frame = findNavFrame();
+			const deadline = Date.now() + 8_000;
+			while (!frame && Date.now() < deadline) {
+				await new Promise((resolve) => setTimeout(resolve, 300));
+				frame = findNavFrame();
+			}
+			if (!frame) return;
+
+			// 等待导航页脚本就绪（setBookmarkLoadingState 定义后再执行），8s 未就绪则跳过
+			const ready = await frame
+				.waitForFunction(() => typeof (window as any).setBookmarkLoadingState === 'function', undefined, {
+					timeout: 8_000
+				})
+				.then(() => true)
+				.catch(() => false);
+			if (!ready) return;
+
+			await frame.evaluate((s) => {
+				// @ts-ignore OCS官方导航页自带的方法
+				window.setBookmarkLoadingState(s);
+			}, state);
+		} catch {
+			// 导航页不可用（页面关闭/跳转中）时静默跳过
+		}
+	};
+}
+
+/**
+ * 运行脚本
+ */
+export async function launchBrowser({
+	executablePath,
+	headless,
+	args,
+	userDataDir,
+	userscripts,
+	enabledScriptCount,
+	extensionPaths,
+	startPage,
+	automationScripts,
+	closeableExtensionHomepages,
+	serverPort,
+	authToken,
+	browserInfo,
+	uid,
+	config,
+	downloadsPath,
+	store,
+	onLaunch
+}: Required<Pick<LaunchOptions, 'executablePath' | 'headless' | 'args'>> & {
+	/** 用户数据目录 */
+	userDataDir: string;
+	/** 自定义用户脚本URL */
+	userscripts: string[];
+	/** 总共启用的用户脚本数量（用于区分"无脚本"和"无需更新"） */
+	enabledScriptCount: number;
+	/** 本次加载的扩展路径列表（用于精确匹配脚本管理器扩展的 service worker） */
+	extensionPaths: string[];
+	/** 起始页 URL：自定义导航页（localhost）或 chrome://newtab */
+	startPage: string;
+	/** 可关闭的浏览器拓展主页 */
+	closeableExtensionHomepages: string[];
+	/** 自动化程序 */
+	automationScripts: AS[];
+	/** OCS服务器端口 */
+	serverPort: number;
+	/** 软件辅助权限认证 */
+	authToken: string;
+	/** 浏览器信息 */
+	browserInfo?: BrowserInfo;
+	uid: string;
+	config?: BrowserConfig;
+	/** 网页下载文件保存目录（未传入时回退为本地浏览器下载） */
+	downloadsPath?: string;
+	/** AppStore 快照（系统自动化程序使用，如脚本列表同步） */
+	store?: AppStore;
+	onLaunch?: (browser: BrowserContext) => void;
+}) {
+	return new Promise<void>((resolve, reject) => {
+		// 启动前把浏览器 profile 的默认下载目录指向软件"文件下载"目录（原生下载行为落盘位置）
+		prepareDownloadPreferences(userDataDir, downloadsPath);
+
+		// Linux 显示环境诊断：worker 由渲染进程 fork，沙箱清理后可能丢失 DISPLAY，
+		// 记录实际环境变量与据此选择的 ozone 平台（经 worker stdout 回流到浏览器日志面板）
+		if (process.platform === 'linux') {
+			console.log(
+				'[display]',
+				`DISPLAY=${process.env.DISPLAY || '(空)'}`,
+				`WAYLAND_DISPLAY=${process.env.WAYLAND_DISPLAY || '(空)'}`,
+				`XDG_SESSION_TYPE=${process.env.XDG_SESSION_TYPE || '(空)'}`,
+				'→',
+				process.env.DISPLAY ? '--ozone-platform-hint=auto' : '--ozone-platform=wayland'
+			);
+		}
+
+		chromium
+			.launchPersistentContext(userDataDir, {
+				headless,
+				viewport: null,
+				executablePath,
+				ignoreHTTPSErrors: true,
+				acceptDownloads: true,
+				ignoreDefaultArgs: ['--disable-extensions', '--enable-automation'],
+				args: [
+					'--window-position=0,0',
+					'--no-first-run',
+					'--no-default-browser-check',
+					'--allow-file-access-from-files',
+					// Linux：ignoreDefaultArgs 移除了 Playwright 默认的 --no-sandbox（沙箱启用），
+					// 而解压分发的 chrome-sandbox 无法满足 setuid root 要求，
+					// 且 Ubuntu 23.10+ AppArmor 限制非受限程序创建 user namespace（兜底方案同样被封堵），
+					// 显式禁用沙箱避免内置浏览器无法启动（与主进程 --no-sandbox 行为一致）；
+					// --disable-setuid-sandbox 一并关闭 setuid 沙箱助手（2.x AppImage 修复移植）
+					...(process.platform === 'linux'
+						? [
+								'--no-sandbox',
+								'--disable-setuid-sandbox',
+								// 显示平台按环境探测：纯 Wayland 会话无 DISPLAY，Chrome 默认走 X11
+								// 报 "Missing X server" → 强制 Wayland；有 DISPLAY 走 X11 正常路径
+								process.env.DISPLAY ? '--ozone-platform-hint=auto' : '--ozone-platform=wayland'
+						  ]
+						: []),
+					// 浏览器增强（防休眠/防冻结）附加参数，开关关闭时为空数组
+					...formatBrowserEnhancementArgs(config),
+					...args
+				]
+			})
+			.then(async (browser) => {
+				// 恢复浏览器原生下载行为（behavior:'default'，保留 download 事件）：
+				// 下载气泡显示真实文件名、文件原生落盘到"文件下载"目录；
+				// 事件仍触发，供 page.on('download') 截胡转发到本地默认浏览器（取消失败时原生落盘兜底）
+				// 「文件下载优化」开关关闭时跳过：保持 Playwright 托管下载（由 saveAs 兜底落盘）
+				const nativeDownloadRestored =
+					config?.download_optimization === false ? false : await restoreNativeDownloadBehavior(browser);
+
+				// 浏览器初始化：反检测注入 / 无页面自动关闭 / 关闭事件处理
+				injectAntiDetection(browser);
+				watchNoPagesAutoClose(browser);
+				handleBrowserClose(browser);
+
+				// 每个页面（含后续新建）的弹窗与下载处理
+				const pageHandle = (page: Page) => {
+					handlePageDialogs(page, config?.enable_dialog);
+					handlePageDownload(page, {
+						downloadsPath,
+						nativeDownloadRestored,
+						download_optimization: config?.download_optimization,
+						uid
+					});
+				};
+				for (const page of browser.pages()) {
+					pageHandle(page);
+				}
+				browser.on('page', pageHandle);
+
+				// 监听下载目录，新文件出现时通知渲染进程（原生落盘 / saveAs 兜底落盘的文件）；
+				// 仅「文件下载优化」开启时启用（关闭后下载流程完全由 Playwright 托管，不监听目录）
+				if (config?.download_optimization !== false) {
+					watchDownloadFolder(uid, downloadsPath);
+				}
+
+				// 浏览器增强：注入静音音频保活脚本（防休眠/防冻结，未开启时内部直接跳过）
+				await injectEnhancementKeepalive(browser, config);
+
+				try {
+					// 加载起始页：自定义导航页（localhost URL）或浏览器默认新标签页，启动即导航
+					const [blankPage] = browser.pages();
+					await blankPage?.goto(startPage).catch(() => {});
+
+					// 显示步骤提示（渲染到导航页，兼容新标签页扩展 iframe）
+					const step = createStepFunction(blankPage, serverPort);
+
+					// 系统自动化程序上下文（静态流程统一编排，见 scripts/system/）
+					const sysCtx: SystemScriptContext = {
+						browser,
+						uid,
+						store,
+						send,
+						step,
+						executablePath,
+						extensionPaths,
+						userDataDir,
+						userscripts,
+						enabledScriptCount,
+						closeableExtensionHomepages
+					};
+
+					// 关键路径系统流程：开发者模式 → 用户脚本权限 → 拓展加载验证（失败中断启动）
+					await runSystemScripts(sysCtx, 'launch');
+
+					// 监听网络请求（注册快且自动化程序依赖，放关键段）
+					// 「软件辅助」开关关闭时不注册路由：脚本不再识别为软件环境，自动化增强不可用
+					if (config?.script_assistance === false) {
+						console.log('软件辅助已关闭：跳过浏览器路由监听，脚本自动化增强不可用');
+					} else {
+						browserNetworkRoute(authToken, browser);
+					}
+
+					// 关键路径就绪：立即通知渲染进程浏览器已可用（launched）。
+					// 用户脚本安装与自动化登录耗时随网络波动大（弱网可达分钟级），转入后台执行，
+					// 进度仍通过 step 提示渲染到导航页，不再阻塞浏览器可用状态。
+					onLaunch?.(browser);
+					resolve();
+
+					// 后台段系统流程：脚本安装/更新 → 拓展主页清理 → 脚本列表双向同步；
+					// 随后运行用户自动化程序（失败不影响浏览器可用状态，仅提示）
+					(async () => {
+						try {
+							await runSystemScripts(sysCtx, 'post');
+							await runAutomationScripts({
+								browser,
+								automationScripts,
+								serverPort,
+								step,
+								uid,
+								ocrManual: !!(store as any)?.render?.setting?.browser?.ocrManual
+							});
+							await step(['浏览器初始化完成。'], { loading: false });
+						} catch (err) {
+							// 后台任务异常（如浏览器被用户提前关闭）：仅记录，不再中断启动流程
+							console.warn('后台初始化任务中断：', err instanceof Error ? err.message : String(err));
+						}
+					})();
+				} catch (err) {
+					reject(err);
+				}
+			})
+			.catch((err) => {
+				reject(err);
+			});
+	});
+}
+
+function send(event: string, ...args: any[]) {
+	process.send?.({ event, args });
+}
+
+/** execFile 的 Promise 包装（用于系统内存查询命令） */
+function execCmd(file: string, args: string[]): Promise<string> {
+	return new Promise((resolve, reject) => {
+		child_process.execFile(file, args, { timeout: 10_000, windowsHide: true }, (err, stdout) => {
+			if (err) reject(err);
+			else resolve(String(stdout));
+		});
+	});
+}
+
+/**
+ * 按 PID 汇总进程真实内存（MB）：
+ * - Linux：读 /proc/<pid>/status 的 VmRSS
+ * - macOS：ps -o rss
+ * - Windows：PowerShell Get-Process 的 WorkingSet64
+ */
+async function getPidsMemoryMB(pids: number[]): Promise<number> {
+	if (pids.length === 0) return 0;
+	if (process.platform === 'linux') {
+		let totalKB = 0;
+		for (const pid of pids) {
+			try {
+				const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
+				const match = status.match(/VmRSS:\s+(\d+)\s+kB/);
+				if (match) totalKB += parseInt(match[1], 10);
+			} catch {
+				// 进程可能已退出，忽略
+			}
+		}
+		return Math.round(totalKB / 1024);
+	}
+	if (process.platform === 'darwin') {
+		const out = await execCmd('ps', ['-o', 'rss=', '-p', pids.join(',')]);
+		const totalKB = out.split('\n').reduce((sum, line) => sum + (parseInt(line.trim(), 10) || 0), 0);
+		return Math.round(totalKB / 1024);
+	}
+	// Windows
+	const out = await execCmd('powershell', [
+		'-NoProfile',
+		'-Command',
+		`(Get-Process -Id ${pids.join(',')} -ErrorAction SilentlyContinue | Measure-Object WorkingSet64 -Sum).Sum`
+	]);
+	return Math.round((parseInt(out.trim(), 10) || 0) / 1024 / 1024);
+}
+
+/**
+ * 将脚本配置转换为可用的对象配置
+ * @param configs
+ */
+function transformScriptConfigToRaw(configs: AS['configs']) {
+	const raw = Object.create({});
+	for (const key in configs) {
+		if (Object.prototype.hasOwnProperty.call(configs, key)) {
+			Reflect.set(raw, key, configs[key].value);
+		}
+	}
+	return raw;
+}
+
+/**
+ * 运行自动化程序
+ */
+async function runAutomationScripts(opts: {
+	browser: BrowserContext;
+	serverPort: number;
+	automationScripts: AS[];
+	step: StepTips;
+	uid: string;
+	/** OCR 手动模式（未安装识别模块时不报错，改为提示人工干预） */
+	ocrManual: boolean;
+}) {
+	const { automationScripts, browser, serverPort, step, uid, ocrManual } = opts;
+	// 人工干预提示节流（15s）：验证码重试循环可能高频触发
+	let lastManualNotice = 0;
+	const onManualCaptcha = () => {
+		const now = Date.now();
+		if (now - lastManualNotice < 15 * 1000) return;
+		lastManualNotice = now;
+		send('ocr-manual-captcha', uid);
+	};
+
+	if (automationScripts.length) {
+		await step(`正在执行自动化程序 - ${automationScripts.map((ps) => ps.name).join('、')} ...`);
+
+		// 多平台脚本互不依赖，并行执行（各开各的 page），弱网下整体耗时从「串行累加」降为「最慢单个」；
+		// 超时按脚本声明（script.timeout），未声明默认 1 分钟；含大量操作/OCR 识别流程的脚本声明 3 分钟。
+		// 超时关闭其页面终止后续操作，避免单脚本挂起拖垮整体初始化
+		const DEFAULT_SCRIPT_TIMEOUT = 60 * 1000;
+		await Promise.allSettled(
+			automationScripts.map(async (ps) => {
+				let configs = transformScriptConfigToRaw(ps.configs);
+
+				// 优先匹配合并后的脚本名；未命中时兼容合并前的旧配置名（迁移补全登录方式）
+				const legacy = LegacyScriptMappings.find((m) => m.names.includes(ps.name));
+				const script = AutomationScripts.find((s) => s.name === ps.name) ?? legacy?.script;
+				if (!script) return;
+				if (legacy) configs = legacy.migrate(configs);
+				script.on('script-data', (...msg) => console.log(...msg));
+				script.on('script-error', (...msg) =>
+					console.error('自动化程序错误：', ...msg.map((m) => ScriptWorker.getTransformedErrorMessage(m)))
+				);
+
+				const scriptTimeout = script.timeout ?? DEFAULT_SCRIPT_TIMEOUT;
+				const page = await browser.newPage();
+				const runPromise = script.run(page, configs, {
+					ocrApiUrl: `http://localhost:${serverPort}/ocr`,
+					ocrApiImageKey: 'image',
+					detBackgroundKey: 'det_bg',
+					detTargetKey: 'det_target',
+					ocrManual,
+					onManualCaptcha
+				});
+				try {
+					const result = await Promise.race([
+						runPromise.then(() => 'done' as const),
+						new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), scriptTimeout))
+					]);
+					if (result === 'timeout') {
+						console.error(`自动化程序执行超时（${scriptTimeout / 1000}s）：${ps.name}，已终止，可稍后手动重试`);
+						// 关闭页面使脚本内 pending 的 Playwright 调用立即 reject，终止后续操作
+						await page.close().catch(() => {});
+						await runPromise.catch(() => {});
+					}
+				} catch (err) {
+					console.error(
+						'自动化程序错误：',
+						ScriptWorker.getTransformedErrorMessage(err instanceof Error ? err.message : String(err))
+					);
+				}
+			})
+		);
+	}
+}
+
+/**
+ * 页面 URL 匹配（F-3）：origin + pathname 精确相等，多匹配时优先完整 URL 全等。
+ * 原实现 url().includes() 子串匹配可被相似 URL 误命中（如 ?next=xxx 包含目标串）。
+ */
+function findPageByUrl(browser: BrowserContext, targetPageUrl: string): Page | undefined {
+	let target: URL;
+	try {
+		target = new URL(targetPageUrl);
+	} catch {
+		return undefined;
+	}
+	const sameOriginPath = (pageUrl: string) => {
+		try {
+			const u = new URL(pageUrl);
+			return u.origin === target.origin && u.pathname === target.pathname;
+		} catch {
+			return false;
+		}
+	};
+	const candidates = browser.pages().filter((p) => sameOriginPath(p.url()));
+	// 多个同路径页面时优先完整 URL 全等（query 一致），否则取第一个
+	return candidates.find((p) => p.url() === targetPageUrl) ?? candidates[0];
+}
+
+/**
+ * 动作白名单（W-1）：与 ocsjs `packages/core/src/utils/playwright.ts` 的 ListOfActions 严格对齐。
+ * 白名单之外的 property 一律 400 拒绝，杜绝 `_get(page, property)` 任意方法路径调用
+ * （如 evaluate/context 等远超"页面操作"的能力）。
+ * ⚠️ ocsjs 未来新增动作时，需同步更新此清单（两仓库注释互相指引）。
+ */
+const ALLOWED_ACTIONS = new Set([
+	'click',
+	'check',
+	'dblclick',
+	'bringToFront',
+	'dragAndDrop',
+	'fill',
+	'focus',
+	'hover',
+	'screenshot',
+	'selectOption',
+	'setInputFiles',
+	'tap',
+	'press',
+	'reload',
+	'waitForRequest',
+	'waitForResponse',
+	'waitForSelector',
+	'keyboard.type',
+	'keyboard.press',
+	'mouse.wheel',
+	'mouse.click',
+	'mouse.dblclick',
+	'mouse.down',
+	'mouse.up',
+	'mouse.move'
+]);
+
+function browserNetworkRoute(authToken: string, browser: BrowserContext) {
+	// F-2：锚定路径结尾（后仅允许 ?、# 或结束），原子串匹配会把 URL 参数含
+	// "ocs-environment" 的网课页面请求误拦并返回假环境
+	browser.route(/\/ocs-environment(\?|#|$)/, async (route) => {
+		await route.fulfill({
+			status: 200,
+			body: JSON.stringify({
+				environment: 'playwright'
+			})
+		});
+	});
+	browser.route(/\/ocs-script-actions(\?|#|$)/, async (route) => {
+		const req = route.request();
+		// F-1：所有失败分支必须 abort/fulfill，仅 return 会让页面 fetch 永远挂起
+		if (req.method().toLocaleUpperCase() !== 'POST') {
+			await route.abort();
+			return;
+		}
+		const headerValue = await req.headerValue('auth-token');
+
+		if (headerValue !== authToken) {
+			await route.abort();
+			return;
+		}
+
+		const { page: targetPageUrl, property, args }: { page: string; property: string; args: any[] } = req.postDataJSON();
+
+		try {
+			const page = browser ? findPageByUrl(browser, targetPageUrl) : undefined;
+			if (!page) {
+				await route.fulfill({ status: 404, body: JSON.stringify({ error: '目标页面不存在' }) });
+				return;
+			}
+
+			// W-1：白名单校验优先于方法取值，任意路径调用在此收口
+			if (!ALLOWED_ACTIONS.has(property)) {
+				await route.fulfill({ status: 400, body: JSON.stringify({ error: `不支持的动作: ${property}` }) });
+				return;
+			}
+
+			const targetFunction: Function = _get(page, property);
+			if (typeof targetFunction !== 'function') {
+				await route.fulfill({ status: 400, body: JSON.stringify({ error: `不支持的动作: ${property}` }) });
+				return;
+			}
+
+			if (property === 'waitForResponse' || property === 'waitForRequest') {
+				args[0] = new RegExp(args[0]);
+			}
+
+			const res = await targetFunction.apply(
+				property.split('.').length > 1 ? _get(page, property.split('.')[0]) : page,
+				args
+			);
+			if (typeof res === 'object') {
+				if (property === 'screenshot') {
+					const buffer: Buffer = res;
+					await route.fulfill({
+						status: 200,
+						body: buffer.toString('base64')
+					});
+				} else if (property === 'waitForResponse') {
+					const response: Response = res;
+
+					await route.fulfill({
+						status: 200,
+						body: JSON.stringify({
+							url: response.url(),
+							status: response.status(),
+							headers: response.headers(),
+							body: await response.body().then((res) => res.toString('utf8'))
+						})
+					});
+				} else if (property === 'waitForRequest') {
+					const request: Request = res;
+					await route.fulfill({
+						status: 200,
+						body: JSON.stringify({
+							url: request.url(),
+							method: request.method(),
+							headers: request.headers(),
+							postData: request.postData()
+						})
+					});
+				} else {
+					await route.fulfill({ status: 200, body: JSON.stringify(res) });
+				}
+			} else {
+				await route.fulfill({ status: 200, body: res ?? 'OK' });
+			}
+		} catch (err) {
+			// 原实现 route.continue() 会把请求放行到网课平台服务器（返回无关 404），
+			// 改为 500 + 错误信息，ocsjs 侧 [RP-ERROR] 日志据此可定位
+			await route.fulfill({
+				status: 500,
+				body: JSON.stringify({ error: err instanceof Error ? err.message : String(err) })
+			});
+			console.error(
+				'脚本软件辅助失败：',
+				ScriptWorker.getTransformedErrorMessage(err instanceof Error ? err.message : String(err), {
+					url: targetPageUrl,
+					property:
+						property === 'click' ? '点击' : property === 'fill' ? '填写' : property === 'check' ? '选中' : property,
+					args: JSON.stringify(args)
+				})
+			);
+		}
+	});
+}
+
+/** 下载处理配置（page 级 download 事件） */
+interface DownloadHandlerConfig {
+	downloadsPath?: string;
+	nativeDownloadRestored?: boolean;
+	download_optimization?: boolean;
+	/** 拓展安装代理：CRX 解压目标（拓展目录），空则不代理 */
+	uid: string;
+}
+
+/** 反检测：隐藏 webdriver 特征（每个页面加载前注入） */
+function injectAntiDetection(browser: BrowserContext) {
+	browser.addInitScript({
+		content: 'Object.defineProperty(navigator, "webdriver", { get: () => false });console.log(navigator)'
+	});
+}
+
+/** 无页面自动关闭：100ms 轮询，全部页面关闭后关闭浏览器 */
+function watchNoPagesAutoClose(browser: BrowserContext) {
+	const interval = setInterval(async () => {
+		if (browser.pages().length === 0) {
+			clearInterval(interval);
+			await browser.close({ reason: 'no pages' });
+		}
+	}, 100);
+}
+
+/** 浏览器关闭时通知渲染端并退出 worker 进程 */
+function handleBrowserClose(browser: BrowserContext) {
+	browser.once('close', () => {
+		send('browser-closed');
+		process.exit();
+	});
+}
+
+/** 页面弹窗处理：默认自动接受（防脚本被弹窗卡住）；enable_dialog 开启时保持原生弹窗 */
+function handlePageDialogs(page: Page, enableDialog?: boolean) {
+	// 按照文档的说法，如果不进行任何处理，则动作会和原版浏览器一致
+	// 如果不进行监听 page.on('dialog') playwright 会自动处理弹窗
+	page.on('dialog', async (dialog) => {
+		if (enableDialog) {
+			// 不进行任何处理
+		} else {
+			await dialog.accept(dialog.defaultValue());
+		}
+	});
+}
+
+/**
+ * 页面下载处理（原生下载行为已由 restoreNativeDownloadBehavior 恢复：气泡显示真实文件名，
+ * 文件原生落盘到"文件下载"目录；此处进一步把下载转发到系统默认浏览器）：
+ * 1. http(s) 链接 → 取消浏览器内下载并交给用户本地默认浏览器（取消失败时原生落盘兜底）；
+ *    注意需要登录态 Cookie 的链接在本地浏览器可能无会话而失败（与早期 OCS 行为一致）。
+ * 2. blob:/data: → 读出内容经本地 HTTP 代理交给系统默认浏览器；读取失败（blob 已被页面
+ *    回收）时：原生行为下由浏览器自行落盘，否则 saveAs 到"文件下载"目录。
+ * 3. 「文件下载优化」关闭时：上述转发全部跳过，下载由 Playwright 托管（saveAs 兜底落盘）。
+ */
+function handlePageDownload(page: Page, config: DownloadHandlerConfig) {
+	page.on('download', async (download) => {
+		const url = download.url();
+		// 不处理脚本安装：.user.js 由脚本管理器接管
+		if (url.endsWith('.user.js')) return;
+		// CRX 拓展安装包：自动化浏览器无法直接安装（Safe Browsing 拦截/系统代理差异等链路问题），
+		// 检测到后仅提示用户手动处理，不做自动安装。应用商店 CRX 走 update2 接口 URL 无后缀，按建议文件名判定
+		const filename = download.suggestedFilename();
+		if (/\.crx$/i.test(filename)) {
+			send('crx-detected', config.uid, filename);
+			return;
+		}
+
+		// 「文件下载优化」开启时才执行转发逻辑；关闭时下载完全由 Playwright 托管（saveAs 兜底落盘）
+		if (config.download_optimization !== false) {
+			// http(s) 链接：取消浏览器内下载并交给本地默认浏览器（取消失败时原生落盘兜底）
+			if (/^https?:\/\//.test(url)) {
+				await download.cancel().catch(() => {});
+				openUrl(url);
+				return;
+			}
+
+			// blob:/data: 读出内容经本地 HTTP 代理交给本地默认浏览器
+			try {
+				const proxyUrl = await proxyDownloadToLocalBrowser(page, url, download.suggestedFilename());
+				await download.cancel().catch(() => {});
+				openUrl(proxyUrl);
+				return;
+			} catch (err) {
+				console.error('blob/data 下载代理失败：', String(err));
+			}
+
+			// 代理失败兜底：原生行为下浏览器会以真实文件名自行落盘（目录监听会通知），无需处理
+			if (config.nativeDownloadRestored) return;
+		}
+
+		if (config.downloadsPath) {
+			try {
+				fs.mkdirSync(config.downloadsPath, { recursive: true });
+				const target = resolveDownloadTarget(config.downloadsPath, download.suggestedFilename());
+				await download.saveAs(target);
+				console.log('文件已下载：', target);
+				return;
+			} catch (err) {
+				console.error('文件下载失败：', String(err));
+			}
+		}
+
+		await download.cancel().catch(() => {});
+	});
+}
+
+/**
+ * 恢复浏览器原生下载行为：通过浏览器根 CDP 会话发送 Browser.setDownloadBehavior { behavior:'default' }。
+ *
+ * 依据 playwright-core 源码：Playwright（acceptDownloads:true）仅在 context 初始化时设置一次
+ * allowAndName（下载存为临时 GUID 文件，即"MD5 文件名"），之后不再重设，启动后覆盖即永久生效。
+ * 恢复后下载气泡显示真实文件名、文件原生落盘到默认下载目录（见 prepareDownloadPreferences）。
+ * eventsEnabled:true 保留 download 事件，供 page.on('download') 把下载转发到系统默认浏览器
+ * （Browser.cancelDownload 按 guid 取消，与下载行为无关）；取消/转发失败时原生落盘自动兜底。
+ * 注意：behavior:'default' 下 Playwright 的 Download artifact 不存在，不能 saveAs。
+ * 返回是否恢复成功；失败时由 page.on('download') 的 saveAs 逻辑兜底。
+ */
+async function restoreNativeDownloadBehavior(browser: BrowserContext): Promise<boolean> {
+	try {
+		const browserInstance = browser.browser();
+		if (!browserInstance) return false;
+		const session = await browserInstance.newBrowserCDPSession();
+		// 不传 browserContextId：作用于默认上下文（persistent context 即默认上下文）
+		await session.send('Browser.setDownloadBehavior', { behavior: 'default', eventsEnabled: true });
+		await session.detach().catch(() => {});
+		return true;
+	} catch (err) {
+		console.error('恢复浏览器原生下载行为失败：', String(err));
+		return false;
+	}
+}
+
+/**
+ * 启动前把浏览器 profile 的默认下载目录写入 userDataDir/Default/Preferences，
+ * 使恢复原生下载行为后文件直接保存到软件"文件下载"目录（Chrome 启动时会合并该配置）。
+ * Preferences 解析失败时不写入，避免破坏用户浏览器配置。
+ */
+function prepareDownloadPreferences(userDataDir: string, downloadsPath?: string) {
+	if (!downloadsPath) return;
+	const defaultDir = path.join(userDataDir, 'Default');
+	const prefsPath = path.join(defaultDir, 'Preferences');
+	let prefs: Record<string, any> = {};
+	if (fs.existsSync(prefsPath)) {
+		try {
+			prefs = JSON.parse(fs.readFileSync(prefsPath, 'utf-8'));
+		} catch {
+			return;
+		}
+	}
+	prefs.download = {
+		...(prefs.download || {}),
+		default_directory: downloadsPath,
+		prompt_for_download: false,
+		directory_upgrade: true
+	};
+	prefs.savefile = { ...(prefs.savefile || {}), default_directory: downloadsPath };
+	try {
+		fs.mkdirSync(defaultDir, { recursive: true });
+		fs.writeFileSync(prefsPath, JSON.stringify(prefs, null, 2));
+	} catch (err) {
+		console.error('预设浏览器默认下载目录失败：', String(err));
+	}
+}
+
+/**
+ * 监听下载目录：新文件出现时通过 file-downloaded 事件通知渲染进程。
+ * 非递归（资源下载均位于子目录，不会误报）；过滤下载中的临时文件（.crdownload 等），
+ * 同一路径去重、事件防抖。watcher 随 worker 进程退出自动释放。
+ */
+function watchDownloadFolder(uid: string, downloadsPath?: string) {
+	if (!downloadsPath || !fs.existsSync(downloadsPath)) return;
+	const isTempFile = (name: string) => /\.(crdownload|partial|part|tmp|download|downloading)$/i.test(name);
+	const notified = new Set<string>();
+	const timers = new Map<string, ReturnType<typeof setTimeout>>();
+	try {
+		fs.watch(downloadsPath, (_event, filename) => {
+			if (!filename || isTempFile(filename)) return;
+			const full = path.join(downloadsPath, filename);
+			const prev = timers.get(full);
+			if (prev) clearTimeout(prev);
+			timers.set(
+				full,
+				setTimeout(() => {
+					timers.delete(full);
+					try {
+						// 文件可能已更名/删除（如 .crdownload 完成改名前的旧事件）
+						if (notified.has(full) || !fs.statSync(full).isFile()) return;
+						notified.add(full);
+						send('file-downloaded', uid, { filename, path: full });
+					} catch {}
+				}, 800)
+			);
+		});
+	} catch (err) {
+		console.error('监听下载目录失败：', String(err));
+	}
+}
+
+/** 生成不冲突的下载目标路径：已存在同名文件时依次追加 (1)(2)... 后缀 */
+function resolveDownloadTarget(dir: string, filename: string) {
+	const ext = path.extname(filename);
+	const base = path.basename(filename, ext);
+	let target = path.join(dir, filename);
+	for (let i = 1; fs.existsSync(target); i++) {
+		target = path.join(dir, `${base} (${i})${ext}`);
+	}
+	return target;
+}
+
+/** 下载代理：blob/data 内容临时文件注册表（token -> 文件信息 + 过期定时器） */
+const proxyDownloadItems = new Map<
+	string,
+	{ filePath: string; filename: string; timer: ReturnType<typeof setTimeout> }
+>();
+let proxyDownloadServer: http.Server | undefined;
+let proxyDownloadPort = 0;
+
+/**
+ * 将浏览器内 blob:/data: 下载代理给系统默认浏览器：
+ * 在创建 blob 的页面内 fetch 出内容写入临时文件，经仅监听 127.0.0.1 的一次性本地
+ * HTTP 服务提供下载，返回代理 URL（由调用方 openUrl 交给本地浏览器）。
+ * 内容读取失败（blob 已被页面 revoke）时抛错，由调用方回退 saveAs。
+ */
+async function proxyDownloadToLocalBrowser(page: Page, url: string, filename: string): Promise<string> {
+	// blob URL 仅在创建它的浏览器进程内有效，必须在页面内读取（随时可能被 revoke）
+	const base64 = await page.evaluate(async (u) => {
+		const res = await fetch(u);
+		if (!res.ok) throw new Error('fetch failed: ' + res.status);
+		const bytes = new Uint8Array(await res.arrayBuffer());
+		let binary = '';
+		const chunk = 0x8000;
+		for (let i = 0; i < bytes.length; i += chunk) {
+			binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk) as any);
+		}
+		return btoa(binary);
+	}, url);
+
+	const port = await ensureProxyDownloadServer();
+	const token = crypto.randomUUID();
+	const tmpDir = path.join(os.tmpdir(), 'ocs-download-proxy');
+	fs.mkdirSync(tmpDir, { recursive: true });
+	const filePath = path.join(tmpDir, token);
+	fs.writeFileSync(filePath, Buffer.from(base64, 'base64'));
+	// 一次性使用 + 5 分钟过期清理（本地浏览器始终未发起下载时兜底）
+	const timer = setTimeout(() => {
+		proxyDownloadItems.delete(token);
+		fs.promises.unlink(filePath).catch(() => {});
+	}, 5 * 60 * 1000);
+	proxyDownloadItems.set(token, { filePath, filename, timer });
+	return `http://127.0.0.1:${port}/d/${token}`;
+}
+
+/** 启动（或复用）仅监听 127.0.0.1 的下载代理服务：随机端口，随 worker 进程退出自动关闭 */
+async function ensureProxyDownloadServer(): Promise<number> {
+	if (proxyDownloadServer && proxyDownloadPort) return proxyDownloadPort;
+	proxyDownloadServer = http.createServer((req, res) => {
+		const token = (req.url || '').match(/^\/d\/([a-f0-9-]+)/)?.[1];
+		const item = token ? proxyDownloadItems.get(token) : undefined;
+		if (!item) {
+			res.statusCode = 404;
+			res.end('not found');
+			return;
+		}
+		// 一次性下载：立即注销并停止过期定时器，响应完成后删除临时文件
+		proxyDownloadItems.delete(token!);
+		clearTimeout(item.timer);
+		res.setHeader(
+			'Content-Disposition',
+			`attachment; filename="download"; filename*=UTF-8''${encodeURIComponent(item.filename)}`
+		);
+		res.setHeader('Content-Type', 'application/octet-stream');
+		try {
+			res.setHeader('Content-Length', fs.statSync(item.filePath).size);
+			const stream = fs.createReadStream(item.filePath);
+			stream.pipe(res);
+			stream.on('close', () => fs.promises.unlink(item.filePath).catch(() => {}));
+			stream.on('error', () => res.end());
+		} catch {
+			res.statusCode = 500;
+			res.end();
+		}
+	});
+	await new Promise<void>((resolve, reject) => {
+		proxyDownloadServer!.once('error', reject);
+		proxyDownloadServer!.listen(0, '127.0.0.1', () => resolve());
+	});
+	proxyDownloadPort = (proxyDownloadServer.address() as AddressInfo).port;
+	return proxyDownloadPort;
+}
+
+function openUrl(url: string) {
+	// Windows 下 start 命令需要空标题参数，URL 必须加引号，否则 & 等字符会被 cmd 解析截断
+	const safeUrl = url.replace(/"/g, '');
+	if (process.platform === 'darwin') {
+		child_process.exec(`open "${safeUrl}"`);
+	} else if (process.platform === 'linux') {
+		child_process.exec(`xdg-open "${safeUrl}"`);
+	} else {
+		child_process.exec(`start "" "${safeUrl}"`);
+	}
+}
+
+function getExtensionName(filepath: string) {
+	return filepath.toLocaleLowerCase().includes('tampermonkey')
+		? '油猴'
+		: filepath.toLocaleLowerCase().includes('scriptcat')
+		? '脚本猫'
+		: path.basename(filepath);
+}

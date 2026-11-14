@@ -1,0 +1,68 @@
+/**
+ * OCS 线上服务常量（app / web 经 vite alias 源码编译共享）。
+ *
+ * 以下独立体系无法 import 本文件，修改常量时需手动同步（各处均有注释互指）：
+ * - packages/app/electron.builder.json  → publish.url      对应 OCS_UPDATER.feedUrl
+ * - upgrader-stub/main.js               → UPDATER_BASE_URL 对应 OCS_UPDATER.feedUrl
+ * - .github/workflows/build.yml         → COS_UPDATER_DIR  对应 OCS_UPDATER.feedUrl 的 COS 路径
+ */
+
+/** 官网 */
+export const OCS_WEBSITE = 'https://github.com/3302294488/leinuo-wangke';
+/** 官网软件下载页 */
+export const OCS_DOWNLOAD_PAGE = 'https://github.com/3302294488/leinuo-wangke/releases';
+/** CDN 域名 */
+export const OCS_CDN = 'https://cdn.ocsjs.com';
+
+/** 软件信息接口（更新日志外的资源/通知/书签/语言等） */
+export const OCS_API = {
+	infos: `${OCS_CDN}/api/ocs-app-infos-v2.json`,
+	langs: `${OCS_CDN}/api/ocs-app-langs-v2.json`,
+	guide: `${OCS_CDN}/articles/app/guide-v2.md`
+};
+
+/** electron-updater 更新源（latest.yml / 安装包 / blockmap / CHANGELOG.md 所在目录） */
+export const OCS_UPDATER = {
+	feedUrl: 'https://github.com/3302294488/leinuo-wangke/releases/latest/download/',
+	changelogFileName: 'CHANGELOG.md'
+};
+
+/** OCS 脚本相关静态资源 */
+export const OCS_SCRIPT_RESOURCES = {
+	index: `${OCS_CDN}/index.js`,
+	easyUs: `${OCS_CDN}/easy-us.js`,
+	style: `${OCS_CDN}/style.css`
+};
+
+/** 本地服务器默认端口（各处 || 15319 兜底统一引用此常量） */
+export const DEFAULT_SERVER_PORT = 15319;
+
+/** 可缓存加速的站点（网络缓存加速功能按站点独立开关/清理） */
+export interface CacheableSite {
+	id: string;
+	name: string;
+	/** 匹配的域名（子串匹配，含子域名） */
+	hosts: string[];
+}
+
+/**
+ * 缓存加速站点清单：
+ * - 脚本托管平台（脚本猫/油猴/油叉）：App 主进程脚本下载与搜索 API 缓存；
+ * - 网课平台（智慧树/超星）：浏览器内静态资源（js/css/图片/媒体）经 Playwright 路由缓存。
+ */
+export const CACHEABLE_SITES: CacheableSite[] = [
+	{ id: 'scriptcat', name: 'ScriptCat 脚本猫', hosts: ['scriptcat.org'] },
+	{ id: 'tampermonkey', name: 'Tampermonkey 油猴', hosts: ['tampermonkey.net'] },
+	{ id: 'greasyfork', name: 'GreasyFork 油叉', hosts: ['greasyfork.org'] },
+	{ id: 'zhihuishu', name: '智慧树', hosts: ['zhihuishu.com'] },
+	{ id: 'chaoxing', name: '超星', hosts: ['chaoxing.com'] }
+];
+
+/** 按 URL 匹配可缓存站点（未命中返回 undefined） */
+export function siteOfUrl(url: string): CacheableSite | undefined {
+	return CACHEABLE_SITES.find((s) => s.hosts.some((h) => url.includes(h)));
+}
+
+/** 受支持的浏览器最高主版本号（超出则无法自动加载脚本管理器拓展）。
+ *  web 端环境检测（utils/environment.ts）与 worker 启动校验（worker/index.ts）共用此阈值 */
+export const SUPPORTED_BROWSER_MAX_MAJOR = 137;

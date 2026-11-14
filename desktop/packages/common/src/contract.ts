@@ -1,0 +1,285 @@
+/**
+ * 跨进程共享契约：主进程（@ocs-desktop/app）与渲染进程（@ocs-desktop/web）共同依赖的
+ * 类型定义集中于此，保证依赖方向单向为 app → common ← web。
+ *
+ * 本文件仅包含类型（type/interface），不产生运行时代码，可安全用于浏览器环境。
+ */
+import type { AxiosRequestConfig } from 'axios';
+import type { LaunchOptions } from 'playwright-core';
+import type { AutomationScript } from './scripts/script';
+import type { Config } from './scripts/interface';
+import type { UpdateInformationResource } from './api';
+import type { getValidBrowsers } from './utils/valid.browser';
+
+/** 应用持久化存储结构（主进程 electron-store 与渲染进程共享） */
+export interface AppStore {
+	name: string;
+	version: string;
+	/** 路径数据 */
+	paths: {
+		'app-path': string;
+		'user-data-path': string;
+		'exe-path': string;
+		'logs-path': string;
+		'config-path': string;
+		/** 浏览器用户数据文件夹 */
+		userDataDirsFolder: string;
+		/** 浏览器下载文件夹 */
+		downloadFolder: string;
+		/** 加载拓展路径 */
+		extensionsFolder: string;
+	};
+	/** 窗口设置 */
+	window: {
+		/** 窗口置顶 */
+		alwaysOnTop: boolean;
+		/** 开机自启 */
+		autoLaunch: boolean;
+		/** 后台运行：关闭窗口时自动隐藏到系统托盘，浏览器保持运行 */
+		hideToTrayOnClose: boolean;
+	};
+	/** 本地服务器数据 */
+	server: {
+		port: number;
+		authToken: string;
+	};
+	/** 更新设置（测试/调试用途，正式用户留空即为线上默认） */
+	updater: {
+		/** 自定义更新源目录（latest.yml 所在 URL），留空使用构建时 publish.url 默认源 */
+		feedUrl: string;
+		/** 自定义软件信息接口 URL（更新日志来源），留空使用默认 ocs-app-infos.json */
+		infosUrl: string;
+		/** 允许降级/同版本覆盖安装（重复测试用，对应 electron-updater allowDowngrade） */
+		allowDowngrade: boolean;
+		/** 强制指定内置浏览器下载源（'' 默认按优先级降级；npmmirror/official/ocs-cdn 用于测试下载链路） */
+		chromeSource: string;
+	};
+	/** 脚本资源覆盖（开发者设置-脚本调试，留空使用默认线上地址 OCS_SCRIPT_RESOURCES） */
+	scriptResources: {
+		/** OCS index 脚本地址 */
+		index: string;
+	};
+	/** 渲染进程数据（磁盘上可能为加密后的字符串，由主进程解密） */
+	render: { [x: string]: any };
+}
+
+/** 用户脚本（渲染进程持久化结构） */
+export interface UserScripts {
+	id: number;
+	/** 用户脚本链接 */
+	url: string;
+	/** 启动自动安装脚本 */
+	enable: boolean;
+	/**
+	 * 脚本信息
+	 */
+	info: any;
+	/** 是否为本地脚本 */
+	isLocalScript: boolean;
+	/** 是否为网络链接加载的脚本 */
+	isInternetLinkScript: boolean;
+	/** 上次成功安装到浏览器的版本，undefined 表示从未通过 OCS 安装过 */
+	lastInstalledVersion?: string;
+	/** 脚本信息上次更新时间（最新版本、描述等信息），0 表示从未更新 */
+	lastInfoUpdateTime?: number;
+}
+
+/** 自动化脚本的纯数据形态（跨进程传输时丢失方法/事件，仅保留数据字段） */
+export type RawAutomationScript = Pick<AutomationScript, 'configs' | 'name' | 'icon' | 'needOCR'>;
+
+/** 批量预下载用户脚本的单项结果 */
+export interface DownloadUserscriptResult {
+	url: string;
+	path: string;
+	success: boolean;
+	error?: string;
+}
+
+/**
+ * 主进程 methods 远程调用契约。
+ * 实现见 @ocs-desktop/app src/tasks/remote.register.ts（const methods: RemoteMethods）。
+ */
+export interface RemoteMethods {
+	autoLaunch: () => void;
+	get: (url: string, config?: AxiosRequestConfig<any> | undefined) => Promise<any>;
+	/** 带磁盘缓存的 GET（脚本猫/GreasyFork 等速度不稳定站点加速）：TTL 内命中缓存，失败回退过期缓存 */
+	cachedGet: (url: string, ttlMs: number) => Promise<any>;
+	getWithStatus: (url: string, config?: AxiosRequestConfig<any> | undefined) => Promise<{ status: number; data: any }>;
+	download: (channel: string, url: string, dest: string) => Promise<string>;
+	unzip: (input: string, output: string) => Promise<void>;
+	getValidBrowsers: typeof getValidBrowsers;
+	getBrowserMajorVersion: (executablePath: string) => number | undefined;
+	getExtensionPaths: (extensionsFolder: string) => string[];
+	/**
+	 * 内置拓展完整性校验（asar 内官方清单为基准）：
+	 * 仅处理已释放的拓展，快检 → 全量哈希 → 不符自动从 asar 重释放；
+	 * 未安装的拓展为 skipped（按需安装，不强制释放）。
+	 */
+	ensureBuiltinExtensionsIntegrity: () => Promise<
+		{ id: string; status: 'ok' | 'repaired' | 'skipped' | 'failed'; error?: string }[]
+	>;
+	/** 按需从 asar 释放指定内置拓展（环境补全/应用中心切换脚本管理器），返回拓展目录 */
+	installBundledExtension: (id: string) => Promise<string>;
+	/** 内置拓展清单（构建期官方渠道获取并钉哈希，随 App 发版更新） */
+	getBundledExtensions: () => {
+		id: string;
+		name: string;
+		version: string;
+		license: string;
+		sourceUrl: string;
+		homepage: string;
+	}[];
+	/** 系统自动化程序清单（开发者设置-自动化程序管理展示） */
+	getSystemScripts: () => { name: string; label?: string; phase: string; order: number }[];
+	/** 下载并安装内置浏览器，返回安装完成后的可执行文件路径 */
+	installBuiltinChrome: () => Promise<string>;
+	exportExcel: (excel: { sheetName: string; list: any[] }[], filename: string) => void;
+	statisticFolderSize: (dir: string) => Promise<number>;
+	// eslint-disable-next-line no-undef
+	getPlatform: () => NodeJS.Platform;
+	getSystemDark: () => boolean;
+	updateApp: (newVersion: UpdateInformationResource) => Promise<void>;
+	/** 手动检查更新，返回当前/最新版本与是否有更新（undefined 表示检查失败）。
+	 *  可携带渲染层最新的 updater 配置，避免持久化防抖未落盘导致主进程读到旧值 */
+	checkUpdate: (
+		config?: AppStore['updater']
+	) => Promise<{ current: string; latest: string; hasUpdate: boolean; message?: string } | undefined>;
+	hideToTray: () => void;
+	quitApp: (code?: number) => void;
+	cancelQuit: () => void;
+	destroyTray: () => void;
+	resetApp: () => void;
+	isEncryptionAvailable: () => boolean;
+	/** 获取本地服务访问令牌（内存态，不落盘） */
+	getServerToken: () => string;
+	/** 获取 Linux 密钥环后端（basic_text = 无密钥环）；非 Linux 返回 undefined */
+	getStorageBackend: () => string | undefined;
+	/** 获取主进程真实显示环境变量（Linux 沙箱会清理渲染进程 env 导致 DISPLAY 丢失，fork worker 前需取回） */
+	getDisplayEnv: () => Record<string, string>;
+	/** HTTP 磁盘缓存统计（网络缓存加速的缓存检测）：条数 + 总字节数 */
+	httpCacheStats: () => { count: number; bytes: number };
+	/** HTTP 磁盘缓存统计（按站点分组，含 unknown） */
+	httpCacheStatsBySite: () => Record<string, { count: number; bytes: number }>;
+	/** 清空 HTTP 磁盘缓存（siteId 为空时清空全部） */
+	clearHttpCache: (siteId?: string) => void;
+	/** 网站图标缓存统计（条数 + 总字节数） */
+	iconCacheStats: () => { count: number; bytes: number };
+	/** 清空网站图标缓存（内存 + 磁盘） */
+	clearIconCache: () => void;
+	isDirectory: (path: string) => boolean;
+	/** 本地 OCR 识别模块是否可用（启动前环境检测：needOCR 的自动化程序依赖） */
+	canOCR: () => boolean;
+	/** 是否 electron-vite dev 开发模式（pnpm dev），dev 下软件无法自动重启 */
+	isDevMode: () => boolean;
+	getRawScripts: () => RawAutomationScript[];
+	encryptRenderString: (plaintext: string) => string;
+	decryptRenderString: (encrypted: string) => string;
+	/** 导出数据：用户密码加密（跨机器可移植） */
+	encryptExportString: (plaintext: string, password: string) => string;
+	/** 导入数据：用户密码解密（密码错误抛错） */
+	decryptExportString: (payload: string, password: string) => string;
+	/** 判断密文是否为密码加密的导出格式 */
+	isPasswordEncrypted: (payload: string) => boolean;
+	saveStore: (plainStoreJson: string, shouldEncrypt: boolean) => void;
+	downloadUserscripts: (urls: string[]) => Promise<DownloadUserscriptResult[]>;
+}
+
+/** worker 初始化参数中的自动化脚本纯数据形态 */
+export type ScriptWorkerAutomationScript = { name: string; configs: Record<string, Config> };
+
+export interface ScriptWorkerBrowserInfo {
+	name: string;
+	notes: string;
+	tags: { color: string; name: string }[];
+}
+
+export interface ScriptWorkerBrowserConfig {
+	/** 是否启用弹窗 */
+	enable_dialog?: boolean;
+	/** 是否启用浏览器界面预览（Page.startScreencast 推流） */
+	screenshot_preview?: boolean;
+	/** 浏览器增强（防休眠/防冻结）：附加防节流启动参数 + 注入静音音频豁免脚本 */
+	browser_enhancement?: boolean;
+	/**
+	 * 软件辅助：监听浏览器路由（ocs-environment / ocs-script-actions）与用户脚本联动。
+	 * 默认 true；关闭后脚本不再识别为软件环境（自动化增强不可用），用于卡顿排查。
+	 */
+	script_assistance?: boolean;
+	/**
+	 * 文件下载优化：恢复浏览器原生下载行为（真实文件名 + 原生落盘）。
+	 * 默认 true；关闭后回退为 Playwright 托管下载，可能无法下载文件。
+	 */
+	download_optimization?: boolean;
+}
+
+export interface ScriptWorkerLangs {
+	error_when_executable_not_found?: string;
+	error_when_browser_version_too_high?: string;
+	error_when_browser_launch_failed_too_fast?: string;
+	error_when_extension_version_too_low?: string;
+	error_when_playwright_selector_timeout?: string;
+	error_when_extension_not_found?: string;
+}
+
+export interface ScriptWorkerInitOptions {
+	store: AppStore;
+	uid: string;
+	cachePath: string;
+	automationScripts: ScriptWorkerAutomationScript[];
+	browserInfo: ScriptWorkerBrowserInfo;
+	config: ScriptWorkerBrowserConfig;
+	langs: ScriptWorkerLangs;
+}
+
+export type ScriptWorkerLaunchOptions = Required<Pick<LaunchOptions, 'executablePath' | 'headless' | 'args'>> & {
+	userDataDir: string;
+	userscripts: string[];
+	/** 总共启用的用户脚本数量（用于区分"无脚本"和"无需更新"） */
+	enabledScriptCount: number;
+};
+
+export interface ScreencastOptions {
+	everyNthFrame?: number;
+	maxWidth?: number;
+	maxHeight?: number;
+	quality?: number;
+}
+
+/** 可推流页面信息（worker 通过 pages-changed 事件广播给渲染进程） */
+export interface ScreencastPageInfo {
+	url: string;
+	title: string;
+	/** 网站图标 URL（页面未声明 favicon 时回退为 origin/favicon.ico） */
+	icon: string;
+}
+
+/** pages-changed 事件负载 */
+export interface ScreencastPagesChangedPayload {
+	/** 当前全部可推流页面（已排除 chrome:// 等内部页面） */
+	pages: ScreencastPageInfo[];
+	/** 当前推流目标页 URL（无则空串） */
+	current: string;
+}
+
+/**
+ * 脚本工作进程（worker）调用契约。
+ * 实现见 @ocs-desktop/app src/worker/index.ts（class ScriptWorker implements ScriptWorker）。
+ */
+export interface ScriptWorker {
+	init(options: ScriptWorkerInitOptions): void;
+	launch(options: ScriptWorkerLaunchOptions): Promise<void>;
+	close(): Promise<void>;
+	bringToFront(): Promise<void>;
+	startScreencast(opts?: ScreencastOptions): Promise<void>;
+	pauseScreencast(): Promise<void>;
+	stopScreencast(): Promise<void>;
+	/** 渲染端汇报已消费的推流帧数（背压反馈：释放在途额度并冲刷暂缓的 ack） */
+	screencastConsumed(count: number): void;
+	/** 切换 screencast 推流目标到指定 URL 的页面（用户在预览卡片上手动选择） */
+	switchScreencastPage(url: string): Promise<void>;
+	kill(): void;
+	debug(...msg: any[]): void;
+	warn(...msg: any[]): void;
+	info(...msg: any[]): void;
+	error(...msg: any[]): void;
+}

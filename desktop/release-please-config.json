@@ -1,0 +1,57 @@
+{
+  "release-type": "node",
+  "include-component-in-tag": false,
+  "separate-pull-requests": true,
+  "bootstrap-sha": "55a3f44f9a45cff86980211747089ee603418a9d",
+  "packages": {
+    ".": {
+      "component": "ocs-desktop",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        "packages/app/package.json"
+      ]
+    }
+  },
+  "changelog-sections": [
+    {
+      "type": "feat",
+      "section": "✨ 新功能"
+    },
+    {
+      "type": "fix",
+      "section": "🐛 问题修复"
+    },
+    {
+      "type": "perf",
+      "section": "⚡ 优化改进"
+    },
+    {
+      "type": "refactor",
+      "section": "♻️ 重构"
+    },
+    {
+      "type": "style",
+      "section": "💄 样式更新"
+    },
+    {
+      "type": "docs",
+      "section": "🔧 其他",
+      "hidden": true
+    },
+    {
+      "type": "chore",
+      "section": "🔧 其他",
+      "hidden": true
+    },
+    {
+      "type": "ci",
+      "section": "🔧 其他",
+      "hidden": true
+    },
+    {
+      "type": "test",
+      "section": "🔧 其他",
+      "hidden": true
+    }
+  ]
+}

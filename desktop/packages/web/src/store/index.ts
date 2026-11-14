@@ -1,0 +1,317 @@
+import { reactive } from 'vue';
+import { remote } from '../utils/remote';
+import defaultsDeep from 'lodash/defaultsDeep';
+import type { AppStore, UserScripts } from '@ocs-desktop/common/web';
+import { CommonUserScript } from '../types/user.script';
+import { FolderOptions } from '../fs/interface';
+import { Browser } from '../fs/browser';
+import { Folder } from '../fs/folder';
+
+export type StoreUserScript = { info?: CommonUserScript } & Omit<UserScripts, 'info'>;
+
+export type WebStore = {
+	scripts: StoreUserScript[];
+	notifies: any[];
+
+	browser: {
+		currentFolderUid: string;
+		currentBrowserUid: string;
+		/** 根目录 */
+		root: FolderOptions<'root', Browser | Folder>;
+		tags: Record<string, { color: string; count: number }>;
+		search: {
+			/** 名字或者备注搜素 */
+			value: string;
+			tags: string[];
+		};
+	};
+	setting: {
+		browserType: 'diy' | 'local' | 'setup';
+		/** 界面模式：简洁模式 / 专业模式 */
+		mode: 'simple' | 'professional';
+		/** 简洁模式卡片布局列数 */
+		simpleCardColumns: 1 | 2 | 3 | 4;
+		/** 简洁模式卡片样式：卡片 / 紧凑（去卡片样式 2px 间隔） / 平铺（全部浏览器去边距平铺铺满） */
+		simpleCardStyle: 'card' | 'compact' | 'tile';
+		/** 简洁模式下仅显示正在运行的浏览器（卡片/紧凑/平铺均生效） */
+		simpleRunningOnly: boolean;
+		/** 浏览器启动参数 */
+		launchOptions: {
+			executablePath: string;
+		};
+		/** 当前的主题 */
+		theme: {
+			/** 主题模式：light 白天 / dark 夜间 / auto 跟随系统 */
+			mode: 'light' | 'dark' | 'auto';
+			/** 主题颜色：blue 默认蓝（对应 theme.less 中 body[theme-color='xxx'] 预设） */
+			color: 'blue' | 'purple' | 'orange' | 'green' | 'cyan';
+		};
+		/** ocs 特殊配置 */
+		ocs: {
+			/** 当前配置名 */
+			currentProjectName: string;
+			/** 全局配置 */
+			store: any;
+			/** 是否同步OCS配置 */
+			openSync: boolean;
+		};
+		browser: {
+			/** 浏览器缓存大小预警阈值（GB） */
+			cachesSizeWarningPoint: number;
+			/** 是否启用浏览器原版对话框 */
+			enableDialog: boolean;
+			/** 是否强制更新/安装脚本 */
+			forceUpdateScript: boolean;
+			/** 是否在浏览器卡片/监控页面中显示运行时界面预览（Page.startScreencast 推流） */
+			screenshotPreview: boolean;
+			/** 预览帧率档位：high(~30fps) / medium(~15fps) / low(~6fps) */
+			screenshotFramerate: 'high' | 'medium' | 'low';
+			/** 预览画质档位：控制分辨率与 jpeg 质量（帧尺寸 = min(显示尺寸×DPR, 档位上限)，背压自动降速），ultra(2K) / high / medium / low */
+			screenshotQuality: 'ultra' | 'high' | 'medium' | 'low';
+			/** 浏览器增强（防休眠/防冻结）：启动时附加防节流参数并注入静音音频豁免，仅对新启动的浏览器生效 */
+			browserEnhancement: boolean;
+			/** CPU/内存启动预检测：启动浏览器前检测剩余内存与 CPU 负载，不足时拦截启动；关闭后忽略警告直接启动 */
+			memoryCheck: boolean;
+			/** 网络缓存加速：脚本猫/GreasyFork 等站点的脚本下载与搜索 API 磁盘缓存；关闭后恢复原始实时加载 */
+			networkCache: boolean;
+			/** 站点级缓存开关（键为 CACHEABLE_SITES 的 id；缺省视为开启） */
+			networkCacheSites: Record<string, boolean>;
+			/** 验证码手动模式：未安装 OCR 识别模块时不报错不提示安装，检测到验证码时提示人工干预 */
+			ocrManual: boolean;
+			/** 导航页设置 */
+			bookmarkPage: {
+				/** 是否启用自定义导航页（关闭后不更改浏览器新建页面，显示默认空白导航页） */
+				enable: boolean;
+				/** 是否启用导航页搜索引擎功能 */
+				enableSearch: boolean;
+				/** 是否启用导航页快捷平台访问 */
+				enableQuickAccess: boolean;
+				/** 自定义网站列表（加载在快捷访问上方） */
+				customSites: { name: string; url: string }[];
+			};
+		};
+		/** 开发者设置（界面仅在「工具 → 开发者工具」点击后显示，开关本身对所有用户生效） */
+		dev: {
+			/**
+			 * 软件辅助：开启后软件监听浏览器路由（ocs-environment / ocs-script-actions），
+			 * 与用户脚本联动提供自动化增强（点击、填写等页面动作）。
+			 * 关闭后脚本不再识别为 playwright 环境，自动化增强不可用（可用于性能排查）。
+			 * 仅对之后启动的浏览器生效。
+			 */
+			scriptAssistance: boolean;
+			/**
+			 * 文件下载优化：开启后恢复浏览器原生下载行为（气泡显示真实文件名、文件原生落盘），
+			 * 模拟真实下载；关闭后回退为 Playwright 托管下载，可能出现无法下载或文件名异常。
+			 * 仅对之后启动的浏览器生效。
+			 */
+			downloadOptimization: boolean;
+			/** 数据加密：关闭后配置数据按明文存储于 config.json（不执行加密） */
+			dataEncryption: boolean;
+			/**
+			 * 系统自动化程序开关（键为脚本名 system:xxx；缺省视为启用）。
+			 * 开发者调试用：可单独停用某个系统自动化程序，仅对之后启动的浏览器生效。
+			 */
+			systemScripts: Record<string, boolean>;
+		};
+	};
+
+	langs: Record<string, string>;
+	state: {
+		/** 是否展示「欢迎使用」介绍弹窗（仅首次进入展示，纯介绍无初始化功能；
+		 *  环境检测与补全已改为启动浏览器时被动自动执行） */
+		welcome: boolean;
+		/** 是否展示「新建浏览器自动初始化」弹窗 */
+		newBrowserSetup: boolean;
+		mini: boolean;
+		responsive: 'mini' | 'small';
+		height: number;
+		/** 当前界面标题（标题栏居中显示文本，路由切换时赋值） */
+		title: string;
+		/** 已读的提示记录 */
+		read_record: {
+			user_script_usage: boolean;
+			browser_usage: boolean;
+			automation_script_usage: boolean;
+			/** 应用设置-使用提示：折叠状态 */
+			resources_usage: boolean;
+		};
+		/** 新手使用指引完成记录（达成一次即永久标记） */
+		guide: {
+			/** 步骤1：软件设置/浏览器环境就绪 */
+			init: boolean;
+			/** 步骤2：成功启动浏览器 */
+			launch: boolean;
+		};
+	};
+};
+
+/** 渲染进程数据的默认值。用于：
+ * 1) 首次加载时与磁盘 store 做 defaultsDeep 合并；
+ * 2) 解密后的 render 对象再做一次 defaultsDeep，补齐后续版本新增的字段（如 state.guide）。
+ *    必须复用同一份，避免新增字段时漏补导致渲染端读取 undefined。 */
+export const DEFAULT_RENDER = {
+	scripts: [],
+	notifies: [],
+	browser: {
+		currentFolderUid: '',
+		currentBrowserUid: '',
+		root: {
+			name: '根目录',
+			parent: undefined,
+			createTime: Date.now(),
+			type: 'root',
+			uid: 'root-folder',
+			children: {},
+			renaming: false
+		},
+		tags: {},
+		search: {
+			value: '',
+			tags: [],
+			results: undefined
+		}
+	},
+	setting: {
+		browserType: 'diy',
+		mode: 'simple' as const,
+		simpleCardColumns: 2 as const,
+		simpleCardStyle: 'card' as const,
+		simpleRunningOnly: false,
+		launchOptions: {
+			executablePath: ''
+		},
+		theme: {
+			mode: 'auto' as const,
+			color: 'blue' as const
+		},
+		ocs: {
+			currentProjectName: '',
+			store: {},
+			openSync: false
+		},
+		browser: {
+			cachesSizeWarningPoint: 10,
+			enableDialog: false,
+			forceUpdateScript: false,
+			screenshotPreview: true,
+			screenshotFramerate: 'low' as const,
+			screenshotQuality: 'medium' as const,
+			browserEnhancement: false,
+			memoryCheck: true,
+			networkCache: true,
+			networkCacheSites: {},
+			ocrManual: false,
+			bookmarkPage: {
+				enable: true,
+				enableSearch: true,
+				enableQuickAccess: true,
+				customSites: []
+			}
+		},
+		// 开发者设置：三项默认开启（与历史行为一致），关闭用于 mac 卡顿等场景排查
+		dev: {
+			scriptAssistance: true,
+			downloadOptimization: true,
+			dataEncryption: true,
+			systemScripts: {}
+		}
+	},
+	langs: {},
+	state: {
+		welcome: true,
+		newBrowserSetup: false,
+		mini: false,
+		responsive: 'small',
+		height: document.documentElement.clientHeight,
+		title: '雷诺网课桌面版 - 首页',
+		read_record: {
+			user_script_usage: false,
+			browser_usage: false,
+			automation_script_usage: false,
+			resources_usage: false
+		},
+		guide: {
+			init: false,
+			launch: false
+		}
+	}
+} as WebStore;
+
+const _store: AppStore & { render: WebStore } = defaultsDeep(remote['electron-store'].get('store'), {
+	render: DEFAULT_RENDER,
+	// 补齐主进程 window 配置中可能缺失的字段（旧版本用户未触发版本迁移时），后台运行默认关闭
+	window: { hideToTrayOnClose: false },
+	// 补齐更新/调试配置（旧版本用户的磁盘 store 无此字段）
+	updater: { feedUrl: '', infosUrl: '', allowDowngrade: false, chromeSource: '' },
+	// 补齐脚本资源覆盖配置
+	scriptResources: { index: '' }
+});
+
+// 解密数据（兼容新旧加密格式）
+// @ts-ignore - render 在磁盘上可能是加密后的字符串
+if (typeof _store.render === 'string') {
+	try {
+		console.log('_store', _store);
+		// @ts-ignore
+		const renderStr = _store.render as string;
+		const data = JSON.parse(remote.methods.callSync('decryptRenderString' as any, renderStr));
+		if (data && typeof data === 'object' && !Array.isArray(data)) {
+			// 迁移：旧版 screenshotQuality 语义为帧率，拆分为 screenshotFramerate(帧率) + screenshotQuality(画质)
+			const _oldBrowser = data?.setting?.browser;
+			if (_oldBrowser && !('screenshotFramerate' in _oldBrowser) && 'screenshotQuality' in _oldBrowser) {
+				_oldBrowser.screenshotFramerate = _oldBrowser.screenshotQuality;
+				_oldBrowser.screenshotQuality = 'medium';
+			}
+			// 解密后的 render 是历史持久化对象，可能缺少后续版本新增的字段，
+			// 再次与默认值合并以补齐（如 state.guide），避免渲染端读取 undefined。
+			Reflect.set(_store, 'render', defaultsDeep(data, DEFAULT_RENDER));
+		} else {
+			// 解密结果不是对象（历史重复加密等数据损坏场景，主进程已尝试逐层恢复）。
+			// 字符串会让 defaultsDeep 产出装箱 String，Vue 对其响应式追踪失效（界面点击无反应），
+			// 因此必须回退为全新默认对象，保证 render 永远是普通对象。
+			console.error('渲染进程数据损坏（解密结果非对象），已重置为默认设置');
+			Reflect.set(_store, 'render', defaultsDeep({}, DEFAULT_RENDER));
+		}
+	} catch (e) {
+		// 解密失败同样必须回退为默认对象，绝不能让 render 残留为字符串
+		console.error('数据解密失败：' + e);
+		Reflect.set(_store, 'render', defaultsDeep({}, DEFAULT_RENDER));
+	}
+}
+
+// 迁移：旧版 theme.dark(boolean) -> theme.mode('light'|'dark'|'auto')
+// defaultsDeep 已补齐 mode:'auto'，此处根据旧 dark 值修正：dark:true -> 'dark'，dark:false -> 'auto'
+const _theme = _store.render?.setting?.theme as { dark?: boolean; mode?: 'light' | 'dark' | 'auto' } | undefined;
+if (_theme && _theme.dark !== undefined) {
+	_theme.mode = _theme.dark ? 'dark' : 'auto';
+	delete _theme.dark;
+}
+
+/** 数据存储对象 */
+export const store: AppStore & { render: WebStore } = reactive(_store);
+
+/**
+ * 开发者会话状态（非持久化）：独立于 store，不经过 saveStore 写入 config.json，
+ * 因此软件重启后自动恢复默认值。用于「开发者设置」卡片的显隐控制
+ * （左上角「工具 → 开发者工具」点击后置为 true）。
+ */
+export const devSession = reactive({
+	/** 是否显示设置页的「开发者设置」卡片 */
+	enabled: false
+});
+
+/** 会话级 UI 跳转请求（跨组件触发，不持久化，消费方读后复位） */
+export const uiSession = reactive({
+	/** 请求设置页切换到「应用中心」并自动打开「其他拓展加载方法」弹窗 */
+	appCenterGuide: false
+});
+
+console.log('store', store);
+// @ts-ignore
+window.store = store;
+
+/** 根目录 */
+export const files = reactive<File[]>([]);
+
+/** 打开的文件 */
+export const openedFiles = reactive(new Map<string, File>());
